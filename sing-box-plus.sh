@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Sing-Box-Plus 管理脚本（18 节点：直连 9 + WARP 9）
-#  Version: v2.4.6
+#  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
+#  Version: v2.5.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -202,9 +202,12 @@ install_singbox_binary() {
   fn="$(find "$tmp" -type f -name 'sing-box' | head -n1)"
   [ -n "$fn" ] || { echo "[ERROR] 包内未找到 sing-box"; rm -rf "$tmp"; return 1; }
 
-  install -m 0755 "$fn" "$SBP_BIN_DIR/sing-box" || { rm -rf "$tmp"; return 1; }
+  local target="${BIN_PATH:-/usr/local/bin/sing-box}"
+  mkdir -p "$(dirname "$target")" "$SBP_BIN_DIR" 2>/dev/null || true
+  install -m 0755 "$fn" "$target" || { rm -rf "$tmp"; return 1; }
+  ln -sf "$target" "$SBP_BIN_DIR/sing-box" 2>/dev/null || true
   rm -rf "$tmp"
-  echo "[OK] 已安装 sing-box 到 $SBP_BIN_DIR/sing-box"
+  echo "[OK] 已安装 sing-box 到 $target"
 }
 
 # 证书兜底（有 openssl 就生成；没有就先跳过，由业务决定是否强制）
@@ -281,17 +284,15 @@ ENABLE_HY2_OBFS=${ENABLE_HY2_OBFS:-true}
 ENABLE_SS2022=${ENABLE_SS2022:-true}
 ENABLE_SS=${ENABLE_SS:-true}
 ENABLE_TUIC=${ENABLE_TUIC:-true}
+ENABLE_ANYTLS=${ENABLE_ANYTLS:-true}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v2.4.6"
+SCRIPT_VERSION="v2.5.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
 VMESS_WS_PATH=${VMESS_WS_PATH:-/vm}
-
-# 兼容 sing-box 1.12.x 的旧 wireguard 出站
-export ENABLE_DEPRECATED_WIREGUARD_OUTBOUND=${ENABLE_DEPRECATED_WIREGUARD_OUTBOUND:-true}
 
 # ===== 颜色 =====
 C_RESET="\033[0m"; C_BOLD="\033[1m"; C_DIM="\033[2m"
@@ -375,7 +376,7 @@ is_uuid(){ [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]; }
 
 ensure_dirs(){ mkdir -p "$SB_DIR" "$DATA_DIR" "$CERT_DIR" "$WGCF_DIR"; }
 
-# ===== 端口（18 个互不重复） =====
+# ===== 端口（20 个互不重复） =====
 PORTS=()
 gen_port() {
   while :; do
@@ -387,9 +388,9 @@ gen_port() {
 rand_ports_reset(){ PORTS=(); }
 
 PORT_VLESSR=""; PORT_VLESS_GRPCR=""; PORT_TROJANR=""; PORT_HY2=""; PORT_VMESS_WS=""
-PORT_HY2_OBFS=""; PORT_SS2022=""; PORT_SS=""; PORT_TUIC=""
+PORT_HY2_OBFS=""; PORT_SS2022=""; PORT_SS=""; PORT_TUIC=""; PORT_ANYTLS=""
 PORT_VLESSR_W=""; PORT_VLESS_GRPCR_W=""; PORT_TROJANR_W=""; PORT_HY2_W=""; PORT_VMESS_WS_W=""
-PORT_HY2_OBFS_W=""; PORT_SS2022_W=""; PORT_SS_W=""; PORT_TUIC_W=""
+PORT_HY2_OBFS_W=""; PORT_SS2022_W=""; PORT_SS_W=""; PORT_TUIC_W=""; PORT_ANYTLS_W=""
 
 save_ports(){ cat > "$SB_DIR/ports.env" <<EOF
 PORT_VLESSR=$PORT_VLESSR
@@ -401,6 +402,7 @@ PORT_HY2_OBFS=$PORT_HY2_OBFS
 PORT_SS2022=$PORT_SS2022
 PORT_SS=$PORT_SS
 PORT_TUIC=$PORT_TUIC
+PORT_ANYTLS=$PORT_ANYTLS
 PORT_VLESSR_W=$PORT_VLESSR_W
 PORT_VLESS_GRPCR_W=$PORT_VLESS_GRPCR_W
 PORT_TROJANR_W=$PORT_TROJANR_W
@@ -410,14 +412,15 @@ PORT_HY2_OBFS_W=$PORT_HY2_OBFS_W
 PORT_SS2022_W=$PORT_SS2022_W
 PORT_SS_W=$PORT_SS_W
 PORT_TUIC_W=$PORT_TUIC_W
+PORT_ANYTLS_W=$PORT_ANYTLS_W
 EOF
 }
 load_ports(){ safe_source_env "$SB_DIR/ports.env" || return 1; }
 
 save_all_ports(){
   rand_ports_reset
-  for v in PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC \
-           PORT_VLESSR_W PORT_VLESS_GRPCR_W PORT_TROJANR_W PORT_HY2_W PORT_VMESS_WS_W PORT_HY2_OBFS_W PORT_SS2022_W PORT_SS_W PORT_TUIC_W; do
+  for v in PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC PORT_ANYTLS \
+           PORT_VLESSR_W PORT_VLESS_GRPCR_W PORT_TROJANR_W PORT_HY2_W PORT_VMESS_WS_W PORT_HY2_OBFS_W PORT_SS2022_W PORT_SS_W PORT_TUIC_W PORT_ANYTLS_W; do
     [[ -n "${!v:-}" ]] && PORTS+=("${!v}")
   done
   [[ -z "${PORT_VLESSR:-}" ]] && PORT_VLESSR=$(gen_port)
@@ -429,6 +432,7 @@ save_all_ports(){
   [[ -z "${PORT_SS2022:-}" ]] && PORT_SS2022=$(gen_port)
   [[ -z "${PORT_SS:-}" ]] && PORT_SS=$(gen_port)
   [[ -z "${PORT_TUIC:-}" ]] && PORT_TUIC=$(gen_port)
+  [[ -z "${PORT_ANYTLS:-}" ]] && PORT_ANYTLS=$(gen_port)
   [[ -z "${PORT_VLESSR_W:-}" ]] && PORT_VLESSR_W=$(gen_port)
   [[ -z "${PORT_VLESS_GRPCR_W:-}" ]] && PORT_VLESS_GRPCR_W=$(gen_port)
   [[ -z "${PORT_TROJANR_W:-}" ]] && PORT_TROJANR_W=$(gen_port)
@@ -438,6 +442,7 @@ save_all_ports(){
   [[ -z "${PORT_SS2022_W:-}" ]] && PORT_SS2022_W=$(gen_port)
   [[ -z "${PORT_SS_W:-}" ]] && PORT_SS_W=$(gen_port)
   [[ -z "${PORT_TUIC_W:-}" ]] && PORT_TUIC_W=$(gen_port)
+  [[ -z "${PORT_ANYTLS_W:-}" ]] && PORT_ANYTLS_W=$(gen_port)
   save_ports
 }
 
@@ -453,6 +458,7 @@ ENABLE_HY2_OBFS=$ENABLE_HY2_OBFS
 ENABLE_SS2022=$ENABLE_SS2022
 ENABLE_SS=$ENABLE_SS
 ENABLE_TUIC=$ENABLE_TUIC
+ENABLE_ANYTLS=$ENABLE_ANYTLS
 ENABLE_WARP=$ENABLE_WARP
 REALITY_SERVER=$REALITY_SERVER
 REALITY_SERVER_PORT=$REALITY_SERVER_PORT
@@ -474,6 +480,7 @@ SS2022_KEY=$SS2022_KEY
 SS_PWD=$SS_PWD
 TUIC_UUID=$TUIC_UUID
 TUIC_PWD=$TUIC_PWD
+ANYTLS_PWD=$ANYTLS_PWD
 EOF
 }
 load_creds(){ safe_source_env "$SB_DIR/creds.env" || return 1; }
@@ -536,6 +543,7 @@ ensure_creds(){
   [[ -z "${SS2022_KEY:-}" ]] && SS2022_KEY=$(rand_b64_32)
   [[ -z "${SS_PWD:-}" ]] && SS_PWD=$(openssl rand -base64 24 | tr -d "=\n" | tr "+/" "-_")
   TUIC_UUID="$UUID"; TUIC_PWD="$UUID"
+  [[ -z "${ANYTLS_PWD:-}" ]] && ANYTLS_PWD=$(rand_b64_32)
   save_creds
 }
 
@@ -698,13 +706,12 @@ install_singbox() {
 # ===== systemd =====
 write_systemd(){ cat > "/etc/systemd/system/${SYSTEMD_SERVICE}" <<EOF
 [Unit]
-Description=Sing-Box (Native 18 nodes)
+Description=Sing-Box (Native 20 nodes)
 After=network-online.target
 Requires=network-online.target
 
 [Service]
 Type=simple
-Environment=ENABLE_DEPRECATED_WIREGUARD_OUTBOUND=true
 ExecStart=${BIN_PATH} run -c ${CONF_JSON} -D ${DATA_DIR}
 Restart=on-failure
 RestartSec=3
@@ -732,12 +739,13 @@ write_config(){
   --arg HY2 "$HY2_PWD" --arg HY22 "$HY2_PWD2" --arg HY2O "$HY2_OBFS_PWD" \
   --arg GRPC "$GRPC_SERVICE" --arg VMWS "$VMESS_WS_PATH" --arg CRT "$CRT" --arg KEY "$KEY" \
   --arg SS2022 "$SS2022_KEY" --arg SSPWD "$SS_PWD" --arg TUICUUID "$TUIC_UUID" --arg TUICPWD "$TUIC_PWD" \
+  --arg ANYTLS "$ANYTLS_PWD" \
   --argjson P1 "$PORT_VLESSR" --argjson P2 "$PORT_VLESS_GRPCR" --argjson P3 "$PORT_TROJANR" \
   --argjson P4 "$PORT_HY2" --argjson P5 "$PORT_VMESS_WS" --argjson P6 "$PORT_HY2_OBFS" \
-  --argjson P7 "$PORT_SS2022" --argjson P8 "$PORT_SS" --argjson P9 "$PORT_TUIC" \
+  --argjson P7 "$PORT_SS2022" --argjson P8 "$PORT_SS" --argjson P9 "$PORT_TUIC" --argjson P10 "$PORT_ANYTLS" \
   --argjson PW1 "$PORT_VLESSR_W" --argjson PW2 "$PORT_VLESS_GRPCR_W" --argjson PW3 "$PORT_TROJANR_W" \
   --argjson PW4 "$PORT_HY2_W" --argjson PW5 "$PORT_VMESS_WS_W" --argjson PW6 "$PORT_HY2_OBFS_W" \
-  --argjson PW7 "$PORT_SS2022_W" --argjson PW8 "$PORT_SS_W" --argjson PW9 "$PORT_TUIC_W" \
+  --argjson PW7 "$PORT_SS2022_W" --argjson PW8 "$PORT_SS_W" --argjson PW9 "$PORT_TUIC_W" --argjson PW10 "$PORT_ANYTLS_W" \
   --arg ENABLE_WARP "$ENABLE_WARP" \
   --arg WPRIV "${WARP_PRIVATE_KEY:-}" --arg WPPUB "${WARP_PEER_PUBLIC_KEY:-}" \
   --arg WHOST "${WARP_ENDPOINT_HOST:-}" --argjson WPORT "${WARP_ENDPOINT_PORT:-0}" \
@@ -753,23 +761,30 @@ write_config(){
   def inbound_ss2022($port): {type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"2022-blake3-aes-256-gcm", password:$SS2022};
   def inbound_ss($port): {type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"aes-256-gcm", password:$SSPWD};
   def inbound_tuic($port): {type:"tuic", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$TUICUUID, password:$TUICPWD}], congestion_control:"bbr", tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h3"]}};
+  def inbound_anytls($port): {type:"anytls", listen:"0.0.0.0", listen_port:$port, users:[{name:"anytls", password:$ANYTLS}], tls:{enabled:true, certificate_path:$CRT, key_path:$KEY}};
 
-  def warp_outbound:
+  def warp_ready:
+    $ENABLE_WARP=="true" and ($WPRIV|length)>0 and ($WPPUB|length)>0 and ($WHOST|length)>0 and ($WPORT>0) and (([$W4, $W6] | map(select(. != "")) | length)>0);
+
+  def warp_endpoint:
     {type:"wireguard", tag:"warp",
-      local_address: ( [ $W4, $W6 ] | map(select(. != "")) ),
-      system_interface: false,
+      system: false,
+      address: ( [ $W4, $W6 ] | map(select(. != "")) ),
       private_key:$WPRIV,
       peers: [ {
-        server:$WHOST, server_port:$WPORT, public_key:$WPPUB,
+        address:$WHOST, port:$WPORT, public_key:$WPPUB,
         reserved: [ $WR1, $WR2, $WR3 ],
-        allowed_ips: ["0.0.0.0/0","::/0"]
+        allowed_ips: ["0.0.0.0/0","::/0"],
+        persistent_keepalive_interval: 30
       } ],
-      mtu:1280
+      mtu:1280,
+      domain_resolver:"dns-remote"
     };
 
   {
     log:{level:"info", timestamp:true},
-    dns:{ servers:[ {tag:"dns-remote", address:"https://1.1.1.1/dns-query", detour:"direct"}, {address:"tls://dns.google", detour:"direct"} ], strategy:"prefer_ipv4" },
+    dns:{ servers:[ {type:"udp", tag:"dns-remote", server:"1.1.1.1"}, {type:"udp", tag:"dns-google", server:"8.8.8.8"} ], strategy:"prefer_ipv4" },
+    endpoints: (if warp_ready then [warp_endpoint] else [] end),
     inbounds:[
       (inbound_vless_flow($P1) + {tag:"vless-reality"}),
       (inbound_vless($P2) + {tag:"vless-grpcr", transport:{type:"grpc", service_name:$GRPC}}),
@@ -780,6 +795,7 @@ write_config(){
       (inbound_ss2022($P7) + {tag:"ss2022"}),
       (inbound_ss($P8) + {tag:"ss"}),
       (inbound_tuic($P9) + {tag:"tuic-v5"}),
+      (inbound_anytls($P10) + {tag:"anytls"}),
 
       (inbound_vless_flow($PW1) + {tag:"vless-reality-warp"}),
       (inbound_vless($PW2) + {tag:"vless-grpcr-warp", transport:{type:"grpc", service_name:$GRPC}}),
@@ -789,19 +805,14 @@ write_config(){
       (inbound_hy2_obfs($PW6) + {tag:"hy2-obfs-warp"}),
       (inbound_ss2022($PW7) + {tag:"ss2022-warp"}),
       (inbound_ss($PW8) + {tag:"ss-warp"}),
-      (inbound_tuic($PW9) + {tag:"tuic-v5-warp"})
+      (inbound_tuic($PW9) + {tag:"tuic-v5-warp"}),
+      (inbound_anytls($PW10) + {tag:"anytls-warp"})
     ],
-    outbounds: (
-      if $ENABLE_WARP=="true" and ($WPRIV|length)>0 and ($WHOST|length)>0 then
-        [{type:"direct", tag:"direct"}, {type:"block", tag:"block"}, warp_outbound]
-      else
-        [{type:"direct", tag:"direct"}, {type:"block", tag:"block"}]
-      end
-    ),
+    outbounds: [{type:"direct", tag:"direct"}],
     route: (
-      if $ENABLE_WARP=="true" and ($WPRIV|length)>0 and ($WHOST|length)>0 then
+      if warp_ready then
         { default_domain_resolver:"dns-remote", rules:[
-            { inbound: ["vless-reality-warp","vless-grpcr-warp","trojan-reality-warp","hy2-warp","vmess-ws-warp","hy2-obfs-warp","ss2022-warp","ss-warp","tuic-v5-warp"], outbound:"warp" }
+            { inbound: ["vless-reality-warp","vless-grpcr-warp","trojan-reality-warp","hy2-warp","vmess-ws-warp","hy2-obfs-warp","ss2022-warp","ss-warp","tuic-v5-warp","anytls-warp"], action:"route", outbound:"warp" }
           ],
           final:"direct"
         }
@@ -817,10 +828,10 @@ write_config(){
 open_firewall(){
   local rules=()
   rules+=("${PORT_VLESSR}/tcp" "${PORT_VLESS_GRPCR}/tcp" "${PORT_TROJANR}/tcp" "${PORT_VMESS_WS}/tcp")
-  rules+=("${PORT_HY2}/udp" "${PORT_HY2_OBFS}/udp" "${PORT_TUIC}/udp")
+  rules+=("${PORT_HY2}/udp" "${PORT_HY2_OBFS}/udp" "${PORT_TUIC}/udp" "${PORT_ANYTLS}/tcp")
   rules+=("${PORT_SS2022}/tcp" "${PORT_SS2022}/udp" "${PORT_SS}/tcp" "${PORT_SS}/udp")
   rules+=("${PORT_VLESSR_W}/tcp" "${PORT_VLESS_GRPCR_W}/tcp" "${PORT_TROJANR_W}/tcp" "${PORT_VMESS_WS_W}/tcp")
-  rules+=("${PORT_HY2_W}/udp" "${PORT_HY2_OBFS_W}/udp" "${PORT_TUIC_W}/udp")
+  rules+=("${PORT_HY2_W}/udp" "${PORT_HY2_OBFS_W}/udp" "${PORT_TUIC_W}/udp" "${PORT_ANYTLS_W}/tcp")
   rules+=("${PORT_SS2022_W}/tcp" "${PORT_SS2022_W}/udp" "${PORT_SS_W}/tcp" "${PORT_SS_W}/udp")
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q -E "active|活跃"; then
     for r in "${rules[@]}"; do ufw allow "$r" >/dev/null 2>&1 || true; done; ufw reload >/dev/null 2>&1 || true
@@ -842,7 +853,7 @@ print_links_grouped(){
   load_env; load_creds; load_ports
   local ip; ip=$(get_ip)
   local links_direct=() links_warp=()
-  # 直连9
+  # 直连10
   links_direct+=("vless://${UUID}@${ip}:${PORT_VLESSR}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality")
   links_direct+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality")
   links_direct+=("trojan://${UUID}@${ip}:${PORT_TROJANR}?security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality")
@@ -856,8 +867,9 @@ JSON
   links_direct+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022}#ss2022")
   links_direct+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS}#ss")
   links_direct+=("tuic://${UUID}:$(urlenc "${UUID}")@${ip}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#tuic-v5")
+  links_direct+=("anytls://$(urlenc "${ANYTLS_PWD}")@${ip}:${PORT_ANYTLS}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#anytls")
 
-  # WARP 9
+  # WARP 10
   links_warp+=("vless://${UUID}@${ip}:${PORT_VLESSR_W}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-warp")
   links_warp+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR_W}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality-warp")
   links_warp+=("trojan://${UUID}@${ip}:${PORT_TROJANR_W}?security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality-warp")
@@ -871,15 +883,16 @@ JSON
   links_warp+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022_W}#ss2022-warp")
   links_warp+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS_W}#ss-warp")
   links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${ip}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#tuic-v5-warp")
+  links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${ip}:${PORT_ANYTLS_W}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#anytls-warp")
 
-  echo -e "${C_BLUE}${C_BOLD}分享链接（18 个）${C_RESET}"
+  echo -e "${C_BLUE}${C_BOLD}分享链接（20 个）${C_RESET}"
   hr
-  echo -e "${C_CYAN}${C_BOLD}【直连节点（9）】${C_RESET}（vless-reality / vless-grpc-reality / trojan-reality / vmess-ws / hy2 / hy2-obfs / ss2022 / ss / tuic）"
+  echo -e "${C_CYAN}${C_BOLD}【直连节点（10）】${C_RESET}（vless-reality / vless-grpc-reality / trojan-reality / vmess-ws / hy2 / hy2-obfs / ss2022 / ss / tuic / anytls）"
   for l in "${links_direct[@]}"; do echo "  $l"; done
   hr
-  echo -e "${C_CYAN}${C_BOLD}【WARP 节点（9）】${C_RESET}（同上 9 种，带 -warp）"
-  echo -e "${C_DIM}说明：带 -warp 的 9 个节点走 Cloudflare WARP 出口，流媒体解锁更友好${C_RESET}"
-  echo -e "${C_DIM}提示：TUIC 默认 allowInsecure=1，v2rayN 导入即用${C_RESET}"
+  echo -e "${C_CYAN}${C_BOLD}【WARP 节点（10）】${C_RESET}（同上 10 种，带 -warp）"
+  echo -e "${C_DIM}说明：带 -warp 的 10 个节点走 Cloudflare WARP 出口，流媒体解锁更友好${C_RESET}"
+  echo -e "${C_DIM}提示：TUIC / AnyTLS 默认 allowInsecure=1，v2rayN 等客户端导入后如不识别 AnyTLS 链接，可手动按端口和密码添加${C_RESET}"
   for l in "${links_warp[@]}"; do echo "  $l"; done
   hr
 }
@@ -914,7 +927,7 @@ banner(){
   echo -e "系统加速状态：$(bbr_state)"
   echo -e "Sing-Box 启动状态：$(sb_service_state)"
   hr
-  echo -e "  ${C_BLUE}1)${C_RESET} 安装/部署（18 节点）"
+  echo -e "  ${C_BLUE}1)${C_RESET} 安装/部署（20 节点）"
   echo -e "  ${C_GREEN}2)${C_RESET} 查看分享链接"
   echo -e "  ${C_GREEN}3)${C_RESET} 重启服务"
   echo -e "  ${C_GREEN}4)${C_RESET} 一键更换所有端口"
@@ -971,13 +984,13 @@ rotate_ports(){
   load_ports || true
   rand_ports_reset
 
-  # 清空 18 项端口变量，触发重新分配不重复端口
+  # 清空 20 项端口变量，触发重新分配不重复端口
   PORT_VLESSR=""; PORT_VLESS_GRPCR=""; PORT_TROJANR=""; PORT_HY2=""; PORT_VMESS_WS=""
-  PORT_HY2_OBFS=""; PORT_SS2022=""; PORT_SS=""; PORT_TUIC=""
+  PORT_HY2_OBFS=""; PORT_SS2022=""; PORT_SS=""; PORT_TUIC=""; PORT_ANYTLS=""
   PORT_VLESSR_W=""; PORT_VLESS_GRPCR_W=""; PORT_TROJANR_W=""; PORT_HY2_W=""; PORT_VMESS_WS_W=""
-  PORT_HY2_OBFS_W=""; PORT_SS2022_W=""; PORT_SS_W=""; PORT_TUIC_W=""
+  PORT_HY2_OBFS_W=""; PORT_SS2022_W=""; PORT_SS_W=""; PORT_TUIC_W=""; PORT_ANYTLS_W=""
 
-  save_all_ports          # 重新生成并保存 18 个不重复端口
+  save_all_ports          # 重新生成并保存 20 个不重复端口
   write_config            # 用新端口重写 /opt/sing-box/config.json
   open_firewall           # ★ 新增：把“当前配置中的端口”全部放行
   systemctl restart "${SYSTEMD_SERVICE}"
@@ -1002,12 +1015,12 @@ deploy_native(){
   install_singbox
   write_config
   info "检查配置 ..."
-  ENABLE_DEPRECATED_WIREGUARD_OUTBOUND=true "$BIN_PATH" check -c "$CONF_JSON"
+  "$BIN_PATH" check -c "$CONF_JSON"
   info "写入并启用 systemd 服务 ..."
   write_systemd
   systemctl restart "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
   open_firewall
-  echo; echo -e "${C_BOLD}${C_GREEN}★ 部署完成（18 节点）${C_RESET}"; echo
+  echo; echo -e "${C_BOLD}${C_GREEN}★ 部署完成（20 节点）${C_RESET}"; echo
   # 打印链接并直接退出
   print_links_grouped
   exit 0
@@ -1015,7 +1028,7 @@ deploy_native(){
 
 ensure_installed_or_hint(){
   if [[ ! -f "$CONF_JSON" ]]; then
-    warn "尚未安装，请先选择 1) 安装/部署（18 节点）"
+    warn "尚未安装，请先选择 1) 安装/部署（20 节点）"
     return 1
   fi
   return 0
