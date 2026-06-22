@@ -761,7 +761,7 @@ write_config(){
   def inbound_ss2022($port): {type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"2022-blake3-aes-256-gcm", password:$SS2022};
   def inbound_ss($port): {type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"aes-256-gcm", password:$SSPWD};
   def inbound_tuic($port): {type:"tuic", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$TUICUUID, password:$TUICPWD}], congestion_control:"bbr", tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h3"]}};
-  def inbound_anytls($port): {type:"anytls", listen:"0.0.0.0", listen_port:$port, users:[{name:"anytls", password:$ANYTLS}], tls:{enabled:true, certificate_path:$CRT, key_path:$KEY}};
+  def inbound_anytls($port): {type:"anytls", listen:"0.0.0.0", listen_port:$port, users:[{name:"anytls", password:$ANYTLS}], tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h2","http/1.1"]}};
 
   def warp_ready:
     $ENABLE_WARP=="true" and ($WPRIV|length)>0 and ($WPPUB|length)>0 and ($WHOST|length)>0 and ($WPORT>0) and (([$W4, $W6] | map(select(. != "")) | length)>0);
@@ -867,7 +867,7 @@ JSON
   links_direct+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022}#ss2022")
   links_direct+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS}#ss")
   links_direct+=("tuic://${UUID}:$(urlenc "${UUID}")@${ip}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#tuic-v5")
-  links_direct+=("anytls://$(urlenc "${ANYTLS_PWD}")@${ip}:${PORT_ANYTLS}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#anytls")
+  links_direct+=("anytls://$(urlenc "${ANYTLS_PWD}")@${ip}:${PORT_ANYTLS}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}&alpn=h2,http/1.1&fp=chrome#anytls")
 
   # WARP 10
   links_warp+=("vless://${UUID}@${ip}:${PORT_VLESSR_W}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-warp")
@@ -883,7 +883,7 @@ JSON
   links_warp+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022_W}#ss2022-warp")
   links_warp+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS_W}#ss-warp")
   links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${ip}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#tuic-v5-warp")
-  links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${ip}:${PORT_ANYTLS_W}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#anytls-warp")
+  links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${ip}:${PORT_ANYTLS_W}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}&alpn=h2,http/1.1&fp=chrome#anytls-warp")
 
   echo -e "${C_BLUE}${C_BOLD}分享链接（20 个）${C_RESET}"
   hr
