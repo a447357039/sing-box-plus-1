@@ -85,7 +85,7 @@ SBP_BIN_ONLY=1 bash sbp.sh
 - NekoBox / sing-box 客户端
 - Shadowrocket / Quantumult X
 
-> AnyTLS 链接规范在不同客户端里的支持不完全一致；如果客户端无法直接导入，可按输出的服务器、端口、SNI 和密码手动添加。
+> AnyTLS 服务端使用 `h2` / `http/1.1` ALPN；分享链接附带 `fp=chrome`。不同客户端对 AnyTLS 链接规范的支持不完全一致；如果客户端无法直接导入，可按输出的服务器、端口、SNI、ALPN 和密码手动添加。
 
 ## 致谢
 
