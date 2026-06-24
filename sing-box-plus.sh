@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v2.5.0
+#  Version: v2.6.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -272,6 +272,13 @@ CONF_JSON=${CONF_JSON:-$SB_DIR/config.json}
 DATA_DIR=${DATA_DIR:-$SB_DIR/data}
 CERT_DIR=${CERT_DIR:-$SB_DIR/cert}
 WGCF_DIR=${WGCF_DIR:-$SB_DIR/wgcf}
+DIAG_DIR=${DIAG_DIR:-$SB_DIR/diagnostics}
+RESTART_LOG=${RESTART_LOG:-$SB_DIR/restart.log}
+DNS_HEALTH_LOG=${DNS_HEALTH_LOG:-$SB_DIR/dns-health.log}
+DNS_HEALTH_BIN=${DNS_HEALTH_BIN:-/usr/local/sbin/sing-box-plus-dns-health}
+EVENT_LOG_BIN=${EVENT_LOG_BIN:-/usr/local/sbin/sing-box-plus-event}
+DNS_HEALTH_SERVICE=${DNS_HEALTH_SERVICE:-sing-box-plus-dns-health.service}
+DNS_HEALTH_TIMER=${DNS_HEALTH_TIMER:-sing-box-plus-dns-health.timer}
 
 # 功能开关（保持稳定默认）
 ENABLE_WARP=${ENABLE_WARP:-true}
@@ -286,9 +293,21 @@ ENABLE_SS=${ENABLE_SS:-true}
 ENABLE_TUIC=${ENABLE_TUIC:-true}
 ENABLE_ANYTLS=${ENABLE_ANYTLS:-true}
 
+# 连接稳定性参数（均可在运行脚本前通过环境变量覆盖）
+SBP_TCP_KEEP_ALIVE_OVERRIDE=${TCP_KEEP_ALIVE-}
+SBP_TCP_KEEP_ALIVE_INTERVAL_OVERRIDE=${TCP_KEEP_ALIVE_INTERVAL-}
+SBP_UDP_TIMEOUT_OVERRIDE=${UDP_TIMEOUT-}
+SBP_WARP_KEEPALIVE_INTERVAL_OVERRIDE=${WARP_KEEPALIVE_INTERVAL-}
+SBP_DNS_HEALTH_INTERVAL_OVERRIDE=${DNS_HEALTH_INTERVAL-}
+TCP_KEEP_ALIVE=${TCP_KEEP_ALIVE:-30s}
+TCP_KEEP_ALIVE_INTERVAL=${TCP_KEEP_ALIVE_INTERVAL:-30s}
+UDP_TIMEOUT=${UDP_TIMEOUT:-10m}
+WARP_KEEPALIVE_INTERVAL=${WARP_KEEPALIVE_INTERVAL:-25}
+DNS_HEALTH_INTERVAL=${DNS_HEALTH_INTERVAL:-2m}
+
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v2.5.0"
+SCRIPT_VERSION="v2.6.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -304,6 +323,31 @@ hr(){ printf "${C_DIM}==========================================================
 info(){ echo -e "[${C_CYAN}信息${C_RESET}] $*"; }
 warn(){ echo -e "[${C_YELLOW}警告${C_RESET}] $*"; }
 die(){  echo -e "[${C_RED}错误${C_RESET}] $*" >&2; exit 1; }
+
+valid_duration(){
+  [[ "${1:-}" =~ ^([0-9]+(ms|s|m|h))+$ ]]
+}
+
+apply_runtime_overrides(){
+  [[ -n "$SBP_TCP_KEEP_ALIVE_OVERRIDE" ]] && TCP_KEEP_ALIVE=$SBP_TCP_KEEP_ALIVE_OVERRIDE
+  [[ -n "$SBP_TCP_KEEP_ALIVE_INTERVAL_OVERRIDE" ]] && TCP_KEEP_ALIVE_INTERVAL=$SBP_TCP_KEEP_ALIVE_INTERVAL_OVERRIDE
+  [[ -n "$SBP_UDP_TIMEOUT_OVERRIDE" ]] && UDP_TIMEOUT=$SBP_UDP_TIMEOUT_OVERRIDE
+  [[ -n "$SBP_WARP_KEEPALIVE_INTERVAL_OVERRIDE" ]] && WARP_KEEPALIVE_INTERVAL=$SBP_WARP_KEEPALIVE_INTERVAL_OVERRIDE
+  [[ -n "$SBP_DNS_HEALTH_INTERVAL_OVERRIDE" ]] && DNS_HEALTH_INTERVAL=$SBP_DNS_HEALTH_INTERVAL_OVERRIDE
+  return 0
+}
+
+normalize_runtime_settings(){
+  valid_duration "$TCP_KEEP_ALIVE" || { warn "TCP_KEEP_ALIVE 无效，已恢复为 30s"; TCP_KEEP_ALIVE=30s; }
+  valid_duration "$TCP_KEEP_ALIVE_INTERVAL" || { warn "TCP_KEEP_ALIVE_INTERVAL 无效，已恢复为 30s"; TCP_KEEP_ALIVE_INTERVAL=30s; }
+  valid_duration "$UDP_TIMEOUT" || { warn "UDP_TIMEOUT 无效，已恢复为 10m"; UDP_TIMEOUT=10m; }
+  valid_duration "$DNS_HEALTH_INTERVAL" || { warn "DNS_HEALTH_INTERVAL 无效，已恢复为 2m"; DNS_HEALTH_INTERVAL=2m; }
+  if [[ ! "$WARP_KEEPALIVE_INTERVAL" =~ ^[0-9]+$ ]] ||
+     (( WARP_KEEPALIVE_INTERVAL < 1 || WARP_KEEPALIVE_INTERVAL > 65535 )); then
+    warn "WARP_KEEPALIVE_INTERVAL 无效，已恢复为 25"
+    WARP_KEEPALIVE_INTERVAL=25
+  fi
+}
 
 # --- 架构映射：uname -m -> 发行资产名 ---
 arch_map() {
@@ -449,6 +493,9 @@ save_all_ports(){
 # ===== env / creds / warp =====
 save_env(){ cat > "$SB_DIR/env.conf" <<EOF
 BIN_PATH=$BIN_PATH
+SYSTEMD_SERVICE=$SYSTEMD_SERVICE
+CONF_JSON=$CONF_JSON
+DATA_DIR=$DATA_DIR
 ENABLE_VLESS_REALITY=$ENABLE_VLESS_REALITY
 ENABLE_VLESS_GRPCR=$ENABLE_VLESS_GRPCR
 ENABLE_TROJAN_REALITY=$ENABLE_TROJAN_REALITY
@@ -464,6 +511,11 @@ REALITY_SERVER=$REALITY_SERVER
 REALITY_SERVER_PORT=$REALITY_SERVER_PORT
 GRPC_SERVICE=$GRPC_SERVICE
 VMESS_WS_PATH=$VMESS_WS_PATH
+TCP_KEEP_ALIVE=$TCP_KEEP_ALIVE
+TCP_KEEP_ALIVE_INTERVAL=$TCP_KEEP_ALIVE_INTERVAL
+UDP_TIMEOUT=$UDP_TIMEOUT
+WARP_KEEPALIVE_INTERVAL=$WARP_KEEPALIVE_INTERVAL
+DNS_HEALTH_INTERVAL=$DNS_HEALTH_INTERVAL
 EOF
 }
 load_env(){ safe_source_env "$SB_DIR/env.conf" || true; }
@@ -703,8 +755,161 @@ install_singbox() {
   info "安装完成：$("$BIN_PATH" version | head -n1)"
 }
 
+# ===== 运行时辅助：DNS 健康切换与服务事件记录 =====
+write_runtime_helpers(){
+  mkdir -p "$(dirname "$DNS_HEALTH_BIN")" "$(dirname "$EVENT_LOG_BIN")"
+
+  cat > "$DNS_HEALTH_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+SB_DIR=${SB_DIR:-/opt/sing-box}
+CONF_JSON=${CONF_JSON:-$SB_DIR/config.json}
+DNS_HEALTH_LOG=${DNS_HEALTH_LOG:-$SB_DIR/dns-health.log}
+BIN_PATH=${BIN_PATH:-/usr/local/bin/sing-box}
+SYSTEMD_SERVICE=${SYSTEMD_SERVICE:-sing-box.service}
+MODE=${1:-check}
+
+[[ -f "$SB_DIR/env.conf" ]] && source "$SB_DIR/env.conf"
+[[ -s "$CONF_JSON" ]] || exit 0
+mkdir -p "$SB_DIR"
+
+log_event(){
+  printf '%s %s\n' "$(date '+%F %T %z')" "$*" >> "$DNS_HEALTH_LOG"
+  local lines
+  lines=$(wc -l < "$DNS_HEALTH_LOG" 2>/dev/null || echo 0)
+  if (( lines > 2000 )); then
+    tail -n 1000 "$DNS_HEALTH_LOG" > "${DNS_HEALTH_LOG}.tmp" &&
+      mv "${DNS_HEALTH_LOG}.tmp" "$DNS_HEALTH_LOG"
+  fi
+}
+
+probe_cloudflare(){
+  curl -4 -fsS --connect-timeout 3 --max-time 6 \
+    --resolve cloudflare-dns.com:443:1.1.1.1 \
+    -H 'accept: application/dns-json' \
+    'https://cloudflare-dns.com/dns-query?name=example.com&type=A' |
+    grep -Eq '"Status"[[:space:]]*:[[:space:]]*0'
+}
+
+probe_google(){
+  curl -4 -fsS --connect-timeout 3 --max-time 6 \
+    --resolve dns.google:443:8.8.8.8 \
+    -H 'accept: application/dns-json' \
+    'https://dns.google/resolve?name=example.com&type=A' |
+    grep -Eq '"Status"[[:space:]]*:[[:space:]]*0'
+}
+
+probe_retry(){
+  "$1" >/dev/null 2>&1 || { sleep 1; "$1" >/dev/null 2>&1; }
+}
+
+if [[ "$MODE" == "--probe" ]]; then
+  if probe_cloudflare >/dev/null 2>&1; then echo "Cloudflare DoH: 正常"; else echo "Cloudflare DoH: 失败"; fi
+  if probe_google >/dev/null 2>&1; then echo "Google DoH: 正常"; else echo "Google DoH: 失败"; fi
+  echo "UDP 备用 DNS: 1.0.0.1:53（仅在两个 DoH 均失败时启用）"
+  echo "当前 DNS: $(jq -r '.dns.final // "未知"' "$CONF_JSON" 2>/dev/null)"
+  exit 0
+fi
+
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$SB_DIR/.dns-health.lock"
+  flock -n 9 || exit 0
+fi
+
+if probe_retry probe_cloudflare; then
+  selected="dns-doh-primary"
+elif probe_retry probe_google; then
+  selected="dns-doh-backup"
+else
+  selected="dns-udp-fallback"
+fi
+
+current=$(jq -r '.dns.final // "dns-doh-primary"' "$CONF_JSON" 2>/dev/null)
+[[ "$current" == "$selected" ]] && exit 0
+
+tmp="${CONF_JSON}.dns-health.$$"
+if ! jq --arg dns "$selected" '
+  .dns.final = $dns
+  | .route.default_domain_resolver = $dns
+  | .outbounds = ((.outbounds // []) | map(if .type == "direct" then .domain_resolver = $dns else . end))
+  | .endpoints = ((.endpoints // []) | map(if .tag == "warp" then .domain_resolver = $dns else . end))
+' "$CONF_JSON" > "$tmp"; then
+  rm -f "$tmp"
+  log_event "DNS 配置切换失败：无法更新 JSON"
+  exit 1
+fi
+
+if ! "$BIN_PATH" check -c "$tmp" >/dev/null 2>&1; then
+  rm -f "$tmp"
+  log_event "DNS 配置切换失败：sing-box 配置检查未通过"
+  exit 1
+fi
+
+chmod 600 "$tmp"
+mv "$tmp" "$CONF_JSON"
+log_event "DNS 切换：$current -> $selected"
+
+if [[ "$MODE" != "--no-restart" ]] && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
+  systemctl restart "$SYSTEMD_SERVICE"
+fi
+EOF
+
+  cat > "$EVENT_LOG_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+SB_DIR=${SB_DIR:-/opt/sing-box}
+RESTART_LOG=${RESTART_LOG:-$SB_DIR/restart.log}
+action=${1:-event}
+mkdir -p "$SB_DIR"
+
+printf '%s action=%s result=%s exit_code=%s exit_status=%s invocation=%s\n' \
+  "$(date '+%F %T %z')" "$action" "${SERVICE_RESULT:-unknown}" \
+  "${EXIT_CODE:-unknown}" "${EXIT_STATUS:-unknown}" "${INVOCATION_ID:-unknown}" >> "$RESTART_LOG"
+
+lines=$(wc -l < "$RESTART_LOG" 2>/dev/null || echo 0)
+if (( lines > 2000 )); then
+  tail -n 1000 "$RESTART_LOG" > "${RESTART_LOG}.tmp" &&
+    mv "${RESTART_LOG}.tmp" "$RESTART_LOG"
+fi
+EOF
+
+  chmod 0755 "$DNS_HEALTH_BIN" "$EVENT_LOG_BIN"
+
+  cat > "/etc/systemd/system/${DNS_HEALTH_SERVICE}" <<EOF
+[Unit]
+Description=Sing-Box-Plus DNS health check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=SB_DIR=${SB_DIR}
+Environment=SYSTEMD_SERVICE=${SYSTEMD_SERVICE}
+ExecStart=${DNS_HEALTH_BIN}
+EOF
+
+  cat > "/etc/systemd/system/${DNS_HEALTH_TIMER}" <<EOF
+[Unit]
+Description=Run Sing-Box-Plus DNS health check periodically
+
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=${DNS_HEALTH_INTERVAL}
+RandomizedDelaySec=15s
+Persistent=true
+Unit=${DNS_HEALTH_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 # ===== systemd =====
-write_systemd(){ cat > "/etc/systemd/system/${SYSTEMD_SERVICE}" <<EOF
+write_systemd(){
+write_runtime_helpers
+cat > "/etc/systemd/system/${SYSTEMD_SERVICE}" <<EOF
 [Unit]
 Description=Sing-Box (Native 20 nodes)
 After=network-online.target
@@ -712,7 +917,12 @@ Requires=network-online.target
 
 [Service]
 Type=simple
+Environment=SB_DIR=${SB_DIR}
+Environment=SYSTEMD_SERVICE=${SYSTEMD_SERVICE}
+ExecStartPre=-${DNS_HEALTH_BIN} --no-restart
 ExecStart=${BIN_PATH} run -c ${CONF_JSON} -D ${DATA_DIR}
+ExecStartPost=${EVENT_LOG_BIN} start
+ExecStopPost=${EVENT_LOG_BIN} stop
 Restart=on-failure
 RestartSec=3
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -724,11 +934,14 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
+systemctl enable --now "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
 }
 
 # ===== 写 config.json（使用你提供的稳定配置逻辑） =====
 write_config(){
   ensure_dirs; load_env || true; load_creds || true; load_ports || true
+  apply_runtime_overrides
+  normalize_runtime_settings
   ensure_creds; save_all_ports; mk_cert
   [[ "$ENABLE_WARP" == "true" ]] && ensure_warp_profile || true
 
@@ -740,6 +953,8 @@ write_config(){
   --arg GRPC "$GRPC_SERVICE" --arg VMWS "$VMESS_WS_PATH" --arg CRT "$CRT" --arg KEY "$KEY" \
   --arg SS2022 "$SS2022_KEY" --arg SSPWD "$SS_PWD" --arg TUICUUID "$TUIC_UUID" --arg TUICPWD "$TUIC_PWD" \
   --arg ANYTLS "$ANYTLS_PWD" \
+  --arg TCPKA "$TCP_KEEP_ALIVE" --arg TCPKAI "$TCP_KEEP_ALIVE_INTERVAL" --arg UDPT "$UDP_TIMEOUT" \
+  --argjson WARP_KEEPALIVE "$WARP_KEEPALIVE_INTERVAL" \
   --argjson P1 "$PORT_VLESSR" --argjson P2 "$PORT_VLESS_GRPCR" --argjson P3 "$PORT_TROJANR" \
   --argjson P4 "$PORT_HY2" --argjson P5 "$PORT_VMESS_WS" --argjson P6 "$PORT_HY2_OBFS" \
   --argjson P7 "$PORT_SS2022" --argjson P8 "$PORT_SS" --argjson P9 "$PORT_TUIC" --argjson P10 "$PORT_ANYTLS" \
@@ -752,16 +967,17 @@ write_config(){
   --arg W4 "${WARP_ADDRESS_V4:-}" --arg W6 "${WARP_ADDRESS_V6:-}" \
   --argjson WR1 "${WARP_RESERVED_1:-0}" --argjson WR2 "${WARP_RESERVED_2:-0}" --argjson WR3 "${WARP_RESERVED_3:-0}" \
   '
-  def inbound_vless($port): {type:"vless", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}};
-  def inbound_vless_flow($port): {type:"vless", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID, flow:"xtls-rprx-vision"}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}};
-  def inbound_trojan($port): {type:"trojan", listen:"0.0.0.0", listen_port:$port, users:[{password:$UID}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}};
-  def inbound_hy2($port): {type:"hysteria2", listen:"0.0.0.0", listen_port:$port, users:[{name:"hy2", password:$HY2}], tls:{enabled:true, certificate_path:$CRT, key_path:$KEY}};
-  def inbound_vmess_ws($port): {type:"vmess", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID}], transport:{type:"ws", path:$VMWS}};
-  def inbound_hy2_obfs($port): {type:"hysteria2", listen:"0.0.0.0", listen_port:$port, users:[{name:"hy2", password:$HY22}], obfs:{type:"salamander", password:$HY2O}, tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h3"]}};
-  def inbound_ss2022($port): {type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"2022-blake3-aes-256-gcm", password:$SS2022};
-  def inbound_ss($port): {type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"aes-256-gcm", password:$SSPWD};
-  def inbound_tuic($port): {type:"tuic", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$TUICUUID, password:$TUICPWD}], congestion_control:"bbr", tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h3"]}};
-  def inbound_anytls($port): {type:"anytls", listen:"0.0.0.0", listen_port:$port, users:[{name:"anytls", password:$ANYTLS}], tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h2","http/1.1"]}};
+  def listen_tuning: {tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, udp_timeout:$UDPT};
+  def inbound_vless($port): ({type:"vless", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}} + listen_tuning);
+  def inbound_vless_flow($port): ({type:"vless", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID, flow:"xtls-rprx-vision"}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}} + listen_tuning);
+  def inbound_trojan($port): ({type:"trojan", listen:"0.0.0.0", listen_port:$port, users:[{password:$UID}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}} + listen_tuning);
+  def inbound_hy2($port): ({type:"hysteria2", listen:"0.0.0.0", listen_port:$port, users:[{name:"hy2", password:$HY2}], tls:{enabled:true, certificate_path:$CRT, key_path:$KEY}} + listen_tuning);
+  def inbound_vmess_ws($port): ({type:"vmess", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID}], transport:{type:"ws", path:$VMWS}} + listen_tuning);
+  def inbound_hy2_obfs($port): ({type:"hysteria2", listen:"0.0.0.0", listen_port:$port, users:[{name:"hy2", password:$HY22}], obfs:{type:"salamander", password:$HY2O}, tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h3"]}} + listen_tuning);
+  def inbound_ss2022($port): ({type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"2022-blake3-aes-256-gcm", password:$SS2022} + listen_tuning);
+  def inbound_ss($port): ({type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"aes-256-gcm", password:$SSPWD} + listen_tuning);
+  def inbound_tuic($port): ({type:"tuic", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$TUICUUID, password:$TUICPWD}], congestion_control:"bbr", tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h3"]}} + listen_tuning);
+  def inbound_anytls($port): ({type:"anytls", listen:"0.0.0.0", listen_port:$port, users:[{name:"anytls", password:$ANYTLS}], tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h2","http/1.1"]}} + listen_tuning);
 
   def warp_ready:
     $ENABLE_WARP=="true" and ($WPRIV|length)>0 and ($WPPUB|length)>0 and ($WHOST|length)>0 and ($WPORT>0) and (([$W4, $W6] | map(select(. != "")) | length)>0);
@@ -775,15 +991,25 @@ write_config(){
         address:$WHOST, port:$WPORT, public_key:$WPPUB,
         reserved: [ $WR1, $WR2, $WR3 ],
         allowed_ips: ["0.0.0.0/0","::/0"],
-        persistent_keepalive_interval: 30
+        persistent_keepalive_interval: $WARP_KEEPALIVE
       } ],
       mtu:1280,
-      domain_resolver:"dns-remote"
+      udp_timeout:$UDPT,
+      domain_resolver:"dns-doh-primary"
     };
 
   {
     log:{level:"info", timestamp:true},
-    dns:{ servers:[ {type:"udp", tag:"dns-remote", server:"1.1.1.1"}, {type:"udp", tag:"dns-google", server:"8.8.8.8"} ], strategy:"prefer_ipv4" },
+    dns:{
+      servers:[
+        {type:"https", tag:"dns-doh-primary", server:"1.1.1.1", path:"/dns-query", tls:{enabled:true, server_name:"cloudflare-dns.com"}, tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI},
+        {type:"https", tag:"dns-doh-backup", server:"8.8.8.8", path:"/dns-query", tls:{enabled:true, server_name:"dns.google"}, tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI},
+        {type:"udp", tag:"dns-udp-fallback", server:"1.0.0.1"}
+      ],
+      final:"dns-doh-primary",
+      strategy:"prefer_ipv4",
+      cache_capacity:4096
+    },
     endpoints: (if warp_ready then [warp_endpoint] else [] end),
     inbounds:[
       (inbound_vless_flow($P1) + {tag:"vless-reality"}),
@@ -808,16 +1034,16 @@ write_config(){
       (inbound_tuic($PW9) + {tag:"tuic-v5-warp"}),
       (inbound_anytls($PW10) + {tag:"anytls-warp"})
     ],
-    outbounds: [{type:"direct", tag:"direct"}],
+    outbounds: [{type:"direct", tag:"direct", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, domain_resolver:"dns-doh-primary"}],
     route: (
       if warp_ready then
-        { default_domain_resolver:"dns-remote", rules:[
+        { default_domain_resolver:"dns-doh-primary", rules:[
             { inbound: ["vless-reality-warp","vless-grpcr-warp","trojan-reality-warp","hy2-warp","vmess-ws-warp","hy2-obfs-warp","ss2022-warp","ss-warp","tuic-v5-warp","anytls-warp"], action:"route", outbound:"warp" }
           ],
           final:"direct"
         }
       else
-        { final:"direct" }
+        { default_domain_resolver:"dns-doh-primary", final:"direct" }
       end
     )
   }' > "$CONF_JSON"
@@ -933,6 +1159,7 @@ banner(){
   echo -e "  ${C_GREEN}4)${C_RESET} 一键更换所有端口"
   echo -e "  ${C_GREEN}5)${C_RESET} 一键开启 BBR"
   echo -e "  ${C_YELLOW}6)${C_RESET} 更新 sing-box 版本"
+  echo -e "  ${C_YELLOW}7)${C_RESET} 一键网络诊断"
   echo -e "  ${C_RED}8)${C_RESET} 卸载"
   echo -e "  ${C_RED}0)${C_RESET} 退出"
   hr
@@ -942,6 +1169,92 @@ banner(){
 restart_service(){
   systemctl restart "${SYSTEMD_SERVICE}" || die "重启失败"
   systemctl --no-pager status "${SYSTEMD_SERVICE}" | sed -n '1,6p' || true
+}
+
+run_diagnostics(){
+  ensure_installed_or_hint || return 0
+  local stamp report conntrack_count conntrack_max
+  load_env || true
+  apply_runtime_overrides
+  normalize_runtime_settings
+  stamp=$(date '+%Y%m%d-%H%M%S')
+  mkdir -p "$DIAG_DIR"
+  report="$DIAG_DIR/diagnostic-${stamp}.log"
+
+  set +e
+  {
+    echo "Sing-Box-Plus 网络诊断"
+    echo "时间: $(date '+%F %T %z')"
+    echo "主机: $(hostname 2>/dev/null)"
+    echo "内核: $(uname -srmo 2>/dev/null)"
+    echo "sing-box: $("$BIN_PATH" version 2>/dev/null | head -n1)"
+    echo
+
+    echo "== 服务状态 =="
+    systemctl show "$SYSTEMD_SERVICE" --no-pager \
+      -p ActiveState -p SubState -p Result -p NRestarts \
+      -p ExecMainStatus -p ActiveEnterTimestamp
+    systemctl is-enabled "$DNS_HEALTH_TIMER" 2>/dev/null | sed 's/^/DNS 健康定时器: /'
+    systemctl is-active "$DNS_HEALTH_TIMER" 2>/dev/null | sed 's/^/DNS 健康定时器状态: /'
+    echo
+
+    echo "== 当前 DNS 与健康检查 =="
+    jq -r '"dns.final=" + (.dns.final // "未设置"),
+      "route.default_domain_resolver=" + (.route.default_domain_resolver // "未设置")' "$CONF_JSON"
+    if [[ -x "$DNS_HEALTH_BIN" ]]; then
+      "$DNS_HEALTH_BIN" --probe
+    else
+      echo "DNS 健康检查脚本尚未安装，请重新执行部署。"
+    fi
+    echo
+
+    echo "== 网络与资源 =="
+    ip -brief address 2>/dev/null
+    echo
+    ip route show default 2>/dev/null
+    ip -6 route show default 2>/dev/null
+    echo
+    ss -s 2>/dev/null
+    free -h 2>/dev/null
+    df -h "$SB_DIR" 2>/dev/null
+    echo "TCP 拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    echo "TCP keepalive: ${TCP_KEEP_ALIVE}/${TCP_KEEP_ALIVE_INTERVAL}"
+    echo "UDP timeout: ${UDP_TIMEOUT}"
+    echo "WARP keepalive: ${WARP_KEEPALIVE_INTERVAL}s"
+    conntrack_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+    conntrack_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+    echo "Conntrack: ${conntrack_count:-未知}/${conntrack_max:-未知}"
+    echo
+
+    echo "== IPv4 外网测试 =="
+    curl -4 -fsS --connect-timeout 3 --max-time 8 \
+      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null |
+      awk -F= '/^(ip|loc|warp)=/{print}'
+    echo
+
+    echo "== 重启记录（最近 30 条） =="
+    if [[ -s "$RESTART_LOG" ]]; then tail -n 30 "$RESTART_LOG"; else echo "暂无记录"; fi
+    echo
+
+    echo "== DNS 切换记录（最近 30 条） =="
+    if [[ -s "$DNS_HEALTH_LOG" ]]; then tail -n 30 "$DNS_HEALTH_LOG"; else echo "暂无记录"; fi
+    echo
+
+    echo "== sing-box 近期异常（最近 2 小时） =="
+    journalctl -u "$SYSTEMD_SERVICE" --since "2 hours ago" --no-pager 2>/dev/null |
+      grep -Ei 'error|warn|timeout|failed|closed|wireguard|warp|dns' |
+      tail -n 100
+    echo
+
+    echo "== 内核近期异常（最近 2 小时） =="
+    journalctl -k --since "2 hours ago" --no-pager 2>/dev/null |
+      grep -Ei 'oom|killed process|conntrack|network|tcp|udp' |
+      tail -n 80
+  } 2>&1 | tee "$report"
+  set -e
+
+  echo
+  info "诊断完成，报告已保存到：$report"
 }
 
 # 更新 sing-box 到最新版本
@@ -1003,7 +1316,10 @@ rotate_ports(){
 uninstall_all(){
   systemctl stop "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
   systemctl disable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
+  systemctl disable --now "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/${SYSTEMD_SERVICE}"
+  rm -f "/etc/systemd/system/${DNS_HEALTH_SERVICE}" "/etc/systemd/system/${DNS_HEALTH_TIMER}"
+  rm -f "$DNS_HEALTH_BIN" "$EVENT_LOG_BIN"
   systemctl daemon-reload
   rm -rf "$SB_DIR"
   echo -e "${C_GREEN}已卸载并清理完成。${C_RESET}"
@@ -1048,17 +1364,31 @@ menu(){
   case "${op:-}" in
   1)
   sbp_bootstrap                                     # 依赖/二进制回退
-  set +e                                            # ← 关闭严格退出，避免中途被杀掉
+  set +e
   echo -e "${C_BLUE}[信息] 正在检查 sing-box 安装状态...${C_RESET}"
-  install_singbox            || true
+  if ! install_singbox; then
+    echo -e "${C_RED}[错误] sing-box 安装失败${C_RESET}"
+    exit 1
+  fi
   ensure_warp_profile        || true
-  write_config               || { echo "[ERR] 生成配置失败"; }
-  write_systemd              || true
+  if ! write_config; then
+    echo -e "${C_RED}[错误] 生成配置失败${C_RESET}"
+    exit 1
+  fi
+  if ! "$BIN_PATH" check -c "$CONF_JSON"; then
+    echo -e "${C_RED}[错误] 配置检查失败，未重启服务${C_RESET}"
+    exit 1
+  fi
+  write_systemd              || { echo -e "${C_RED}[错误] systemd 服务写入失败${C_RESET}"; exit 1; }
   open_firewall              || true
-  systemctl restart "${SYSTEMD_SERVICE}" || true
-  set -e                                            # ← 恢复严格模式
+  if ! systemctl restart "${SYSTEMD_SERVICE}"; then
+    systemctl --no-pager status "${SYSTEMD_SERVICE}" | sed -n '1,12p' || true
+    echo -e "${C_RED}[错误] sing-box 启动失败，请运行 7) 一键网络诊断${C_RESET}"
+    exit 1
+  fi
+  set -e
   print_links_grouped
-  exit 0                                          # ← 打印后直接退出
+  exit 0
   ;;
     
     2) if ensure_installed_or_hint; then print_links_grouped; exit 0; fi ;;
@@ -1066,6 +1396,7 @@ menu(){
    4) if ensure_installed_or_hint; then rotate_ports; fi; menu ;;
     5) enable_bbr; read -rp "回车返回..." _ || true; menu ;;
     6) update_singbox; read -rp "回车返回..." _ || true; menu ;;
+    7) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
     8) uninstall_all ;; # 直接退出
     0|q|Q) exit 0 ;;
     *) echo -e "${C_YELLOW}无效选项，请重新选择${C_RESET}"; sleep 1; menu ;;
