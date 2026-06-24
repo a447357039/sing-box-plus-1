@@ -7,6 +7,9 @@
 - **20 个代理节点**：10 个直连 + 10 个 WARP 出口（解锁流媒体更友好）
 - **支持协议**：VLESS Reality、VLESS gRPC Reality、Trojan Reality、Hysteria2、VMess WS、Hysteria2 obfs、SS2022、SS、TUIC v5、AnyTLS
 - **新版兼容**：配置生成已迁移到 sing-box 1.13+ 可用的 DNS 服务器格式和 WireGuard endpoint
+- **连接稳定性**：TCP keepalive、可配置 UDP timeout、WARP 25 秒保活
+- **DNS 故障切换**：Cloudflare DoH → Google DoH → UDP 备用 DNS
+- **运行诊断**：一键生成网络报告，并持久记录服务重启和 DNS 切换
 - **全自动化**：依赖安装、证书生成、防火墙配置、BBR 加速
 - **多发行版支持**：Debian/Ubuntu、CentOS/RHEL、Arch、openSUSE
 
@@ -39,6 +42,8 @@ bash sbp.sh
 | 3 | 重启服务 |
 | 4 | 一键更换所有端口 |
 | 5 | 一键开启 BBR |
+| 6 | 更新 sing-box 版本 |
+| 7 | 一键网络诊断 |
 | 8 | 卸载 |
 | 0 | 退出 |
 
@@ -61,6 +66,9 @@ bash sbp.sh
 | 端口信息 | `/opt/sing-box/ports.env` |
 | WARP 配置 | `/opt/sing-box/warp.env` |
 | 证书 | `/opt/sing-box/cert/` |
+| 重启记录 | `/opt/sing-box/restart.log` |
+| DNS 切换记录 | `/opt/sing-box/dns-health.log` |
+| 网络诊断报告 | `/opt/sing-box/diagnostics/` |
 
 ## 环境变量
 
@@ -75,7 +83,16 @@ SBP_SKIP_DEPS=1 bash sbp.sh
 
 # 强制二进制模式（跳过包管理器）
 SBP_BIN_ONLY=1 bash sbp.sh
+
+# 调整 UDP NAT 过期时间（默认 10 分钟）
+UDP_TIMEOUT=15m bash sbp.sh
+
+# 调整 TCP 保活和 DNS 健康检查周期
+TCP_KEEP_ALIVE=30s TCP_KEEP_ALIVE_INTERVAL=30s \
+WARP_KEEPALIVE_INTERVAL=25 DNS_HEALTH_INTERVAL=2m bash sbp.sh
 ```
+
+网络参数会保存到 `/opt/sing-box/env.conf`。DNS 健康检查由轻量 systemd timer 执行；只有当前 DNS 上游发生变化时才会重启 sing-box，并写入切换和重启记录。
 
 ## 客户端导入
 
