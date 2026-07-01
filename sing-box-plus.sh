@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v2.6.0
+#  Version: v2.7.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -279,6 +279,7 @@ DNS_HEALTH_BIN=${DNS_HEALTH_BIN:-/usr/local/sbin/sing-box-plus-dns-health}
 EVENT_LOG_BIN=${EVENT_LOG_BIN:-/usr/local/sbin/sing-box-plus-event}
 DNS_HEALTH_SERVICE=${DNS_HEALTH_SERVICE:-sing-box-plus-dns-health.service}
 DNS_HEALTH_TIMER=${DNS_HEALTH_TIMER:-sing-box-plus-dns-health.timer}
+ROUTE_JSON=${ROUTE_JSON:-$SB_DIR/routes.json}
 
 # 功能开关（保持稳定默认）
 ENABLE_WARP=${ENABLE_WARP:-true}
@@ -307,7 +308,7 @@ DNS_HEALTH_INTERVAL=${DNS_HEALTH_INTERVAL:-2m}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v2.6.0"
+SCRIPT_VERSION="v2.7.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -398,6 +399,59 @@ urlenc(){ # 纯 bash urlencode（不依赖 python）
     esac
   done
   printf "%s" "$out"
+}
+urldec(){
+  local s="${1//+/ }"
+  printf '%b' "${s//%/\\x}"
+}
+b64dec(){
+  local s="$1" pad
+  s="${s//-/+}"; s="${s//_/\/}"
+  pad=$(( (4 - ${#s} % 4) % 4 ))
+  while (( pad > 0 )); do s+="="; pad=$((pad-1)); done
+  printf '%s' "$s" | base64 -d 2>/dev/null || printf '%s' "$s" | base64 --decode 2>/dev/null
+}
+query_get(){
+  local query="$1" key="$2" pair k v
+  local -a pairs
+  [[ -n "$query" ]] || return 0
+  IFS='&' read -r -a pairs <<< "$query"
+  for pair in "${pairs[@]}"; do
+    k="${pair%%=*}"
+    v="${pair#*=}"
+    [[ "$(urldec "$k")" == "$key" ]] || continue
+    urldec "$v"
+    return 0
+  done
+  return 0
+}
+split_hostport(){
+  local hostport="$1"
+  SBP_PARSED_HOST=""; SBP_PARSED_PORT=""
+  if [[ "$hostport" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+    SBP_PARSED_HOST="${BASH_REMATCH[1]}"
+    SBP_PARSED_PORT="${BASH_REMATCH[2]}"
+  elif [[ "$hostport" == *:* ]]; then
+    SBP_PARSED_HOST="${hostport%:*}"
+    SBP_PARSED_PORT="${hostport##*:}"
+  else
+    return 1
+  fi
+  [[ "$SBP_PARSED_PORT" =~ ^[0-9]+$ ]]
+}
+alpn_to_json(){
+  printf '%s' "${1:-}" | jq -R 'split(",") | map(select(length > 0))'
+}
+tls_enabled_json(){
+  local sni="${1:-}" insecure="${2:-false}" alpn_json="${3:-[]}" fp="${4:-}"
+  jq -n \
+    --arg sni "$sni" --arg fp "$fp" \
+    --argjson insecure "$insecure" --argjson alpn "$alpn_json" \
+    '{enabled:true}
+    | if $sni != "" then .server_name = $sni else . end
+    | if $insecure then .insecure = true else . end
+    | if ($alpn | length) > 0 then .alpn = $alpn else . end
+    | if $fp != "" then .utls = {enabled:true, fingerprint:$fp} else . end'
 }
 
 safe_source_env(){ # 安全 source，忽略不存在文件
@@ -496,6 +550,7 @@ BIN_PATH=$BIN_PATH
 SYSTEMD_SERVICE=$SYSTEMD_SERVICE
 CONF_JSON=$CONF_JSON
 DATA_DIR=$DATA_DIR
+ROUTE_JSON=$ROUTE_JSON
 ENABLE_VLESS_REALITY=$ENABLE_VLESS_REALITY
 ENABLE_VLESS_GRPCR=$ENABLE_VLESS_GRPCR
 ENABLE_TROJAN_REALITY=$ENABLE_TROJAN_REALITY
@@ -550,6 +605,286 @@ WARP_RESERVED_3=$WARP_RESERVED_3
 EOF
 }
 load_warp(){ safe_source_env "$SB_DIR/warp.env" || return 1; }
+
+# ===== 自定义路由 =====
+empty_route_json(){ printf '%s\n' '{"rules":[],"rule_set":[],"outbounds":[]}'; }
+
+default_ipv4_address(){
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+default_ipv6_address(){
+  ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+valid_route_tag(){
+  [[ "${1:-}" =~ ^[A-Za-z0-9._@!-]+$ ]]
+}
+
+ensure_route_file(){
+  ensure_dirs
+  if [[ ! -s "$ROUTE_JSON" ]]; then
+    empty_route_json > "$ROUTE_JSON"
+    return 0
+  fi
+  if ! jq -e 'type == "object"' "$ROUTE_JSON" >/dev/null 2>&1; then
+    local bad="${ROUTE_JSON}.bad.$(date +%Y%m%d-%H%M%S)"
+    mv "$ROUTE_JSON" "$bad"
+    warn "自定义路由文件格式无效，已备份到：$bad"
+    empty_route_json > "$ROUTE_JSON"
+  fi
+}
+
+load_route_json(){
+  if [[ -s "$ROUTE_JSON" ]] && jq -e 'type == "object"' "$ROUTE_JSON" >/dev/null 2>&1; then
+    jq -c '.rules = (.rules // []) | .rule_set = (.rule_set // []) | .outbounds = (.outbounds // [])' "$ROUTE_JSON"
+  else
+    empty_route_json
+  fi
+}
+
+parse_route_match_json(){
+  local raw="$1" token key value code tag url json
+  json='{"domain":[],"domain_suffix":[],"domain_keyword":[],"domain_regex":[],"rule_set":[],"rule_set_defs":[]}'
+  raw="${raw//$'\r'/ }"
+  raw="${raw//$'\n'/ }"
+  raw="${raw//,/ }"
+  for token in $raw; do
+    [[ -n "$token" ]] || continue
+    key=""
+    value="$token"
+    case "$token" in
+      geosite:*|site:*) key="geosite"; value="${token#*:}" ;;
+      domain:*) key="domain"; value="${token#*:}" ;;
+      suffix:*) key="suffix"; value="${token#*:}" ;;
+      keyword:*) key="keyword"; value="${token#*:}" ;;
+      regex:*) key="regex"; value="${token#*:}" ;;
+      *.*) key="suffix" ;;
+      *) key="geosite" ;;
+    esac
+    [[ -n "$value" ]] || continue
+    case "$key" in
+      geosite)
+        code="$value"
+        if ! valid_route_tag "$code"; then
+          warn "跳过无效 geosite：$code"
+          continue
+        fi
+        tag="geosite-${code}"
+        url="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${tag}.srs"
+        json=$(printf '%s' "$json" | jq -c \
+          --arg tag "$tag" --arg url "$url" '
+          .rule_set += [$tag]
+          | .rule_set = (.rule_set | unique)
+          | .rule_set_defs += [{type:"remote", tag:$tag, format:"binary", url:$url, download_detour:"direct", update_interval:"1d"}]
+          | .rule_set_defs = (.rule_set_defs | unique_by(.tag))')
+        ;;
+      domain)
+        json=$(printf '%s' "$json" | jq -c --arg v "$value" '.domain += [$v] | .domain = (.domain | unique)')
+        ;;
+      suffix)
+        json=$(printf '%s' "$json" | jq -c --arg v "$value" '.domain_suffix += [$v] | .domain_suffix = (.domain_suffix | unique)')
+        ;;
+      keyword)
+        json=$(printf '%s' "$json" | jq -c --arg v "$value" '.domain_keyword += [$v] | .domain_keyword = (.domain_keyword | unique)')
+        ;;
+      regex)
+        json=$(printf '%s' "$json" | jq -c --arg v "$value" '.domain_regex += [$v] | .domain_regex = (.domain_regex | unique)')
+        ;;
+    esac
+  done
+  printf '%s' "$json" | jq -c '
+    with_entries(select(
+      (.key == "rule_set_defs") or
+      ((.value | type) != "array") or
+      ((.value | length) > 0)
+    ))'
+}
+
+share_link_to_outbound(){
+  local link="$1" tag="$2" scheme rest body query userinfo hostport server port
+  local sni fp insecure allow alpn alpn_json tls_json transport_type
+  link="${link//$'\r'/}"
+  link="${link//$'\n'/}"
+  scheme="${link%%://*}"
+  [[ "$scheme" != "$link" ]] || return 1
+  rest="${link#*://}"
+  body="${rest%%\#*}"
+  query=""
+  if [[ "$body" == *"?"* ]]; then
+    query="${body#*\?}"
+    body="${body%%\?*}"
+  fi
+
+  case "$scheme" in
+    vless|trojan|hy2|hysteria2|tuic|anytls)
+      [[ "$body" == *"@"* ]] || return 1
+      userinfo="${body%@*}"
+      hostport="${body##*@}"
+      split_hostport "$hostport" || return 1
+      server="$SBP_PARSED_HOST"; port="$SBP_PARSED_PORT"
+      ;;
+  esac
+
+  case "$scheme" in
+    vless)
+      local uuid flow security pbk sid grpc_service ws_path ws_host
+      uuid="$(urldec "$userinfo")"
+      flow="$(query_get "$query" flow)"
+      security="$(query_get "$query" security)"
+      sni="$(query_get "$query" sni)"
+      fp="$(query_get "$query" fp)"
+      pbk="$(query_get "$query" pbk)"
+      sid="$(query_get "$query" sid)"
+      transport_type="$(query_get "$query" type)"
+      grpc_service="$(query_get "$query" serviceName)"
+      ws_path="$(query_get "$query" path)"
+      ws_host="$(query_get "$query" host)"
+      jq -n -c \
+        --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" \
+        --arg flow "$flow" --arg security "$security" --arg sni "$sni" --arg fp "${fp:-chrome}" \
+        --arg pbk "$pbk" --arg sid "$sid" --arg transport "$transport_type" \
+        --arg grpc "$grpc_service" --arg path "$ws_path" --arg host "$ws_host" '
+        {type:"vless", tag:$tag, server:$server, server_port:$port, uuid:$uuid, domain_resolver:"dns-doh-primary"}
+        | if $flow != "" then .flow = $flow else . end
+        | if $security == "reality" then
+            .tls = {enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:$fp}, reality:{enabled:true, public_key:$pbk, short_id:$sid}}
+          elif $security == "tls" then
+            .tls = ({enabled:true} | if $sni != "" then .server_name = $sni else . end | if $fp != "" then .utls = {enabled:true, fingerprint:$fp} else . end)
+          else . end
+        | if $transport == "grpc" then
+            .transport = {type:"grpc", service_name:$grpc}
+          elif $transport == "ws" then
+            .transport = ({type:"ws", path:$path} | if $host != "" then .headers = {Host:$host} else . end)
+          else . end'
+      ;;
+    trojan)
+      local password security pbk sid grpc_service ws_path ws_host
+      password="$(urldec "$userinfo")"
+      security="$(query_get "$query" security)"
+      sni="$(query_get "$query" sni)"
+      fp="$(query_get "$query" fp)"
+      pbk="$(query_get "$query" pbk)"
+      sid="$(query_get "$query" sid)"
+      transport_type="$(query_get "$query" type)"
+      grpc_service="$(query_get "$query" serviceName)"
+      ws_path="$(query_get "$query" path)"
+      ws_host="$(query_get "$query" host)"
+      jq -n -c \
+        --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg password "$password" \
+        --arg security "$security" --arg sni "$sni" --arg fp "${fp:-chrome}" \
+        --arg pbk "$pbk" --arg sid "$sid" --arg transport "$transport_type" \
+        --arg grpc "$grpc_service" --arg path "$ws_path" --arg host "$ws_host" '
+        {type:"trojan", tag:$tag, server:$server, server_port:$port, password:$password, domain_resolver:"dns-doh-primary"}
+        | if $security == "reality" then
+            .tls = {enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:$fp}, reality:{enabled:true, public_key:$pbk, short_id:$sid}}
+          elif $security == "tls" then
+            .tls = ({enabled:true} | if $sni != "" then .server_name = $sni else . end | if $fp != "" then .utls = {enabled:true, fingerprint:$fp} else . end)
+          else . end
+        | if $transport == "grpc" then
+            .transport = {type:"grpc", service_name:$grpc}
+          elif $transport == "ws" then
+            .transport = ({type:"ws", path:$path} | if $host != "" then .headers = {Host:$host} else . end)
+          else . end'
+      ;;
+    hy2|hysteria2)
+      local password obfs obfs_pwd
+      password="$(urldec "$userinfo")"
+      sni="$(query_get "$query" sni)"
+      insecure="$(query_get "$query" insecure)"
+      allow="$(query_get "$query" allowInsecure)"
+      alpn="$(query_get "$query" alpn)"
+      obfs="$(query_get "$query" obfs)"
+      obfs_pwd="$(query_get "$query" obfs-password)"
+      [[ "$insecure" == "1" || "$allow" == "1" ]] && insecure=true || insecure=false
+      alpn_json="$(alpn_to_json "$alpn")"
+      tls_json="$(tls_enabled_json "$sni" "$insecure" "$alpn_json" "")"
+      jq -n -c \
+        --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg password "$password" \
+        --arg obfs "$obfs" --arg obfs_pwd "$obfs_pwd" --argjson tls "$tls_json" '
+        {type:"hysteria2", tag:$tag, server:$server, server_port:$port, password:$password, tls:$tls, domain_resolver:"dns-doh-primary"}
+        | if $obfs == "salamander" and $obfs_pwd != "" then .obfs = {type:"salamander", password:$obfs_pwd} else . end'
+      ;;
+    vmess)
+      local payload decoded
+      payload="${rest%%\#*}"
+      decoded="$(b64dec "$payload")" || return 1
+      printf '%s' "$decoded" | jq -c --arg tag "$tag" '
+        . as $v
+        | {type:"vmess", tag:$tag, server:$v.add, server_port:($v.port | tonumber), uuid:$v.id,
+           security:($v.scy // "auto"), alter_id:(($v.aid // "0") | tonumber), domain_resolver:"dns-doh-primary"}
+        | if ($v.net // "") == "ws" then
+            .transport = ({type:"ws", path:($v.path // "")} | if (($v.host // "") != "") then .headers = {Host:$v.host} else . end)
+          else . end
+        | if ($v.tls // "") == "tls" then
+            .tls = ({enabled:true} | if (($v.sni // $v.host // "") != "") then .server_name = ($v.sni // $v.host) else . end)
+          else . end'
+      ;;
+    ss)
+      local ss_body decoded methodpass method password
+      ss_body="$body"
+      if [[ "$ss_body" == *"@"* ]]; then
+        userinfo="${ss_body%@*}"
+        hostport="${ss_body##*@}"
+        methodpass="$(b64dec "$userinfo" 2>/dev/null || printf '%s' "$userinfo")"
+      else
+        decoded="$(b64dec "$ss_body")" || return 1
+        methodpass="${decoded%@*}"
+        hostport="${decoded##*@}"
+      fi
+      split_hostport "$hostport" || return 1
+      server="$SBP_PARSED_HOST"; port="$SBP_PARSED_PORT"
+      [[ "$methodpass" == *:* ]] || return 1
+      method="${methodpass%%:*}"
+      password="${methodpass#*:}"
+      jq -n -c \
+        --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+        --arg method "$method" --arg password "$password" \
+        '{type:"shadowsocks", tag:$tag, server:$server, server_port:$port, method:$method, password:$password, domain_resolver:"dns-doh-primary"}'
+      ;;
+    tuic)
+      local uuid password cc
+      userinfo="$(urldec "$userinfo")"
+      [[ "$userinfo" == *:* ]] || return 1
+      uuid="${userinfo%%:*}"
+      password="${userinfo#*:}"
+      cc="$(query_get "$query" congestion_control)"
+      sni="$(query_get "$query" sni)"
+      insecure="$(query_get "$query" insecure)"
+      allow="$(query_get "$query" allowInsecure)"
+      alpn="$(query_get "$query" alpn)"
+      fp="$(query_get "$query" fp)"
+      [[ "$insecure" == "1" || "$allow" == "1" ]] && insecure=true || insecure=false
+      alpn_json="$(alpn_to_json "$alpn")"
+      tls_json="$(tls_enabled_json "$sni" "$insecure" "$alpn_json" "$fp")"
+      jq -n -c \
+        --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+        --arg uuid "$uuid" --arg password "$password" --arg cc "${cc:-bbr}" --argjson tls "$tls_json" \
+        '{type:"tuic", tag:$tag, server:$server, server_port:$port, uuid:$uuid, password:$password,
+          congestion_control:$cc, tls:$tls, domain_resolver:"dns-doh-primary"}'
+      ;;
+    anytls)
+      local password
+      password="$(urldec "$userinfo")"
+      sni="$(query_get "$query" sni)"
+      insecure="$(query_get "$query" insecure)"
+      allow="$(query_get "$query" allowInsecure)"
+      alpn="$(query_get "$query" alpn)"
+      fp="$(query_get "$query" fp)"
+      [[ "$insecure" == "1" || "$allow" == "1" ]] && insecure=true || insecure=false
+      alpn_json="$(alpn_to_json "$alpn")"
+      tls_json="$(tls_enabled_json "$sni" "$insecure" "$alpn_json" "$fp")"
+      jq -n -c \
+        --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+        --arg password "$password" --argjson tls "$tls_json" \
+        '{type:"anytls", tag:$tag, server:$server, server_port:$port, password:$password,
+          tls:$tls, domain_resolver:"dns-doh-primary"}'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 # 生成 8 字节十六进制（16 个 hex 字符）
 rand_hex8(){
@@ -832,7 +1167,12 @@ tmp="${CONF_JSON}.dns-health.$$"
 if ! jq --arg dns "$selected" '
   .dns.final = $dns
   | .route.default_domain_resolver = $dns
-  | .outbounds = ((.outbounds // []) | map(if .type == "direct" then .domain_resolver = $dns else . end))
+  | .outbounds = ((.outbounds // []) | map(
+      if .tag == "direct-ipv4" then .domain_resolver = {server:$dns, strategy:"ipv4_only"}
+      elif .tag == "direct-ipv6" then .domain_resolver = {server:$dns, strategy:"ipv6_only"}
+      elif .type == "direct" then .domain_resolver = $dns
+      else . end
+    ))
   | .endpoints = ((.endpoints // []) | map(if .tag == "warp" then .domain_resolver = $dns else . end))
 ' "$CONF_JSON" > "$tmp"; then
   rm -f "$tmp"
@@ -946,6 +1286,10 @@ write_config(){
   [[ "$ENABLE_WARP" == "true" ]] && ensure_warp_profile || true
 
   local CRT="$CERT_DIR/fullchain.pem" KEY="$CERT_DIR/key.pem"
+  local ROUTING_JSON BIND4 BIND6
+  ROUTING_JSON="$(load_route_json)"
+  BIND4="$(default_ipv4_address || true)"
+  BIND6="$(default_ipv6_address || true)"
   jq -n \
   --arg RS "$REALITY_SERVER" --argjson RSP "${REALITY_SERVER_PORT:-443}" --arg UID "$UUID" \
   --arg RPR "$REALITY_PRIV" --arg RPB "$REALITY_PUB" --arg SID "$REALITY_SID" \
@@ -966,6 +1310,7 @@ write_config(){
   --arg WHOST "${WARP_ENDPOINT_HOST:-}" --argjson WPORT "${WARP_ENDPOINT_PORT:-0}" \
   --arg W4 "${WARP_ADDRESS_V4:-}" --arg W6 "${WARP_ADDRESS_V6:-}" \
   --argjson WR1 "${WARP_RESERVED_1:-0}" --argjson WR2 "${WARP_RESERVED_2:-0}" --argjson WR3 "${WARP_RESERVED_3:-0}" \
+  --arg BIND4 "$BIND4" --arg BIND6 "$BIND6" --argjson CUSTOM_ROUTES "$ROUTING_JSON" \
   '
   def listen_tuning: {tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, udp_timeout:$UDPT};
   def inbound_vless($port): ({type:"vless", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}} + listen_tuning);
@@ -997,6 +1342,54 @@ write_config(){
       udp_timeout:$UDPT,
       domain_resolver:"dns-doh-primary"
     };
+
+  def custom_rule_sets:
+    (($CUSTOM_ROUTES.rule_set // []) | map(select((.tag // "") != "")));
+
+  def custom_outbounds:
+    (($CUSTOM_ROUTES.outbounds // []) | map(select((.tag // "") != "" and (.type // "") != "")));
+
+  def custom_uses_outbound($tag):
+    ((($CUSTOM_ROUTES.rules // []) | map(select((.outbound // "") == $tag)) | length) > 0);
+
+  def custom_route_rule($rule):
+    ({}
+      + (if (($rule.domain // []) | length) > 0 then {domain:$rule.domain} else {} end)
+      + (if (($rule.domain_suffix // []) | length) > 0 then {domain_suffix:$rule.domain_suffix} else {} end)
+      + (if (($rule.domain_keyword // []) | length) > 0 then {domain_keyword:$rule.domain_keyword} else {} end)
+      + (if (($rule.domain_regex // []) | length) > 0 then {domain_regex:$rule.domain_regex} else {} end)
+      + (if (($rule.rule_set // []) | length) > 0 then {rule_set:$rule.rule_set} else {} end)
+      + {action:"route", outbound:$rule.outbound});
+
+  def custom_route_rules:
+    (($CUSTOM_ROUTES.rules // [])
+      | map(select((.outbound // "") != ""))
+      | map(custom_route_rule(.))
+      | map(select((keys - ["action","outbound"]) | length > 0)));
+
+  def warp_inbound_rule:
+    { inbound: ["vless-reality-warp","vless-grpcr-warp","trojan-reality-warp","hy2-warp","vmess-ws-warp","hy2-obfs-warp","ss2022-warp","ss-warp","tuic-v5-warp","anytls-warp"], action:"route", outbound:"warp" };
+
+  def route_rules:
+    custom_route_rules + (if warp_ready then [warp_inbound_rule] else [] end);
+
+  def direct_outbound:
+    {type:"direct", tag:"direct", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, domain_resolver:"dns-doh-primary"};
+
+  def direct_ipv4_outbound:
+    ({type:"direct", tag:"direct-ipv4", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI,
+      domain_resolver:{server:"dns-doh-primary", strategy:"ipv4_only"}}
+      + (if $BIND4 != "" then {inet4_bind_address:$BIND4, bind_address_no_port:true} else {} end));
+
+  def direct_ipv6_outbound:
+    ({type:"direct", tag:"direct-ipv6", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI,
+      domain_resolver:{server:"dns-doh-primary", strategy:"ipv6_only"}}
+      + (if $BIND6 != "" then {inet6_bind_address:$BIND6, bind_address_no_port:true} else {} end));
+
+  def route_config:
+    ({default_domain_resolver:"dns-doh-primary", final:"direct"}
+      + (if (route_rules | length) > 0 then {rules:route_rules} else {} end)
+      + (if (custom_rule_sets | length) > 0 then {rule_set:custom_rule_sets} else {} end));
 
   {
     log:{level:"info", timestamp:true},
@@ -1034,18 +1427,11 @@ write_config(){
       (inbound_tuic($PW9) + {tag:"tuic-v5-warp"}),
       (inbound_anytls($PW10) + {tag:"anytls-warp"})
     ],
-    outbounds: [{type:"direct", tag:"direct", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, domain_resolver:"dns-doh-primary"}],
-    route: (
-      if warp_ready then
-        { default_domain_resolver:"dns-doh-primary", rules:[
-            { inbound: ["vless-reality-warp","vless-grpcr-warp","trojan-reality-warp","hy2-warp","vmess-ws-warp","hy2-obfs-warp","ss2022-warp","ss-warp","tuic-v5-warp","anytls-warp"], action:"route", outbound:"warp" }
-          ],
-          final:"direct"
-        }
-      else
-        { default_domain_resolver:"dns-doh-primary", final:"direct" }
-      end
-    )
+    outbounds: ([direct_outbound]
+      + (if custom_uses_outbound("direct-ipv4") then [direct_ipv4_outbound] else [] end)
+      + (if custom_uses_outbound("direct-ipv6") then [direct_ipv6_outbound] else [] end)
+      + custom_outbounds),
+    route: route_config
   }' > "$CONF_JSON"
   save_env
 }
@@ -1123,6 +1509,322 @@ JSON
   hr
 }
 
+# ===== 自定义路由菜单 =====
+apply_custom_routing(){
+  local route_bak="${1:-}" conf_bak
+  conf_bak="$(mktemp)"
+  [[ -f "$CONF_JSON" ]] && cp "$CONF_JSON" "$conf_bak" || true
+
+  if ! write_config; then
+    [[ -n "$route_bak" && -f "$route_bak" ]] && cp "$route_bak" "$ROUTE_JSON"
+    [[ -s "$conf_bak" ]] && cp "$conf_bak" "$CONF_JSON"
+    rm -f "$conf_bak"
+    warn "生成配置失败，已回滚自定义路由。"
+    return 1
+  fi
+
+  if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$CONF_JSON"; then
+    [[ -n "$route_bak" && -f "$route_bak" ]] && cp "$route_bak" "$ROUTE_JSON"
+    [[ -s "$conf_bak" ]] && cp "$conf_bak" "$CONF_JSON"
+    rm -f "$conf_bak"
+    warn "sing-box 配置检查失败，已回滚自定义路由。"
+    return 1
+  fi
+
+  rm -f "$conf_bak"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
+    systemctl restart "${SYSTEMD_SERVICE}" || { warn "配置已写入，但服务重启失败"; return 1; }
+    info "自定义路由已应用并重启服务。"
+  else
+    info "自定义路由已写入配置；服务未运行，未自动重启。"
+  fi
+}
+
+print_custom_routes(){
+  ensure_route_file
+  local ip4 ip6
+  ip4="$(default_ipv4_address || true)"
+  ip6="$(default_ipv6_address || true)"
+  echo -e "${C_CYAN}当前本机出口:${C_RESET} IPv4=${ip4:-未检测到} IPv6=${ip6:-未检测到}"
+  echo
+  jq -r '
+    def match_text:
+      [(.domain // [] | map("domain:" + .))[],
+       (.domain_suffix // [] | map("suffix:" + .))[],
+       (.domain_keyword // [] | map("keyword:" + .))[],
+       (.domain_regex // [] | map("regex:" + .))[],
+       (.rule_set // [] | map("rule-set:" + .))[]] | join(", ");
+    "自定义路由规则:",
+    (if ((.rules // []) | length) == 0 then
+      "  （无）"
+    else
+      (.rules // [] | to_entries[] | "  \(.key + 1)) \((.value.name // "未命名")) -> \(.value.outbound) | \(.value | match_text)")
+    end),
+    "",
+    "导入的远程出口:",
+    (if ((.outbounds // []) | length) == 0 then
+      "  （无）"
+    else
+      (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)]")
+    end)
+  ' "$ROUTE_JSON"
+}
+
+select_route_outbound(){
+  local ip4 ip6 choice idx tag
+  local -a imported
+  SBP_SELECTED_OUTBOUND=""
+  ip4="$(default_ipv4_address || true)"
+  ip6="$(default_ipv6_address || true)"
+  mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$ROUTE_JSON")
+
+  echo "选择这条规则使用的出口："
+  echo "  1) 本机 WARP（warp）"
+  echo "  2) 本机 IPv4（direct-ipv4，当前 ${ip4:-未检测到}）"
+  echo "  3) 本机 IPv6（direct-ipv6，当前 ${ip6:-未检测到}）"
+  idx=4
+  for tag in "${imported[@]}"; do
+    echo "  ${idx}) 导入出口：${tag}"
+    idx=$((idx+1))
+  done
+  read -rp "选择出口: " choice || return 1
+  case "$choice" in
+    1)
+      if ! load_warp >/dev/null 2>&1; then
+        warn "尚未检测到 WARP 配置；应用时会尝试生成，失败则该规则无法通过检查。"
+      fi
+      SBP_SELECTED_OUTBOUND="warp"
+      ;;
+    2)
+      [[ -n "$ip4" ]] || warn "未检测到本机 IPv4，规则仍会使用 ipv4_only 解析策略。"
+      SBP_SELECTED_OUTBOUND="direct-ipv4"
+      ;;
+    3)
+      [[ -n "$ip6" ]] || warn "未检测到本机 IPv6，规则仍会使用 ipv6_only 解析策略。"
+      SBP_SELECTED_OUTBOUND="direct-ipv6"
+      ;;
+    *)
+      if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        idx=$((choice-4))
+        if (( idx >= 0 && idx < ${#imported[@]} )); then
+          SBP_SELECTED_OUTBOUND="${imported[$idx]}"
+        fi
+      fi
+      ;;
+  esac
+  [[ -n "$SBP_SELECTED_OUTBOUND" ]] || { warn "无效出口选择"; return 1; }
+}
+
+add_custom_route_rule(){
+  ensure_route_file
+  select_route_outbound || return 1
+  echo
+  echo "输入匹配项，逗号或空格分隔。"
+  echo "示例：geosite:netflix, suffix:openai.com, domain:example.com, keyword:google"
+  echo "简写：netflix 会按 geosite 处理；example.com 会按域名后缀处理。"
+  local matches name match_json route_bak tmp
+  read -rp "匹配项: " matches || return 1
+  match_json="$(parse_route_match_json "$matches")"
+  if ! printf '%s' "$match_json" | jq -e '
+    (((.domain // []) | length)
+    + ((.domain_suffix // []) | length)
+    + ((.domain_keyword // []) | length)
+    + ((.domain_regex // []) | length)
+    + ((.rule_set // []) | length)) > 0
+  ' >/dev/null; then
+    warn "没有可用匹配项，已取消。"
+    return 1
+  fi
+  read -rp "规则名称（可留空）: " name || true
+
+  route_bak="$(mktemp)"
+  cp "$ROUTE_JSON" "$route_bak"
+  tmp="$(mktemp)"
+  if jq -c --argjson match "$match_json" --arg outbound "$SBP_SELECTED_OUTBOUND" --arg name "$name" '
+    .rules = (.rules // [])
+    | .rule_set = (.rule_set // [])
+    | .outbounds = (.outbounds // [])
+    | .rules += [($match | del(.rule_set_defs) + {outbound:$outbound} + (if $name != "" then {name:$name} else {} end))]
+    | .rule_set = ((.rule_set + ($match.rule_set_defs // [])) | unique_by(.tag))
+  ' "$ROUTE_JSON" > "$tmp"; then
+    mv "$tmp" "$ROUTE_JSON"
+    apply_custom_routing "$route_bak"
+  else
+    rm -f "$tmp"
+    cp "$route_bak" "$ROUTE_JSON"
+    warn "写入路由规则失败。"
+  fi
+  rm -f "$route_bak"
+}
+
+import_custom_route_outbound(){
+  ensure_route_file
+  local tag raw outbound src_tag route_bak tmp
+  read -rp "给这个远程出口起一个 tag（例如 hk-vps）: " tag || return 1
+  if ! valid_route_tag "$tag"; then
+    warn "tag 只能包含字母、数字、点、下划线、短横线、@、!。"
+    return 1
+  fi
+  case "$tag" in
+    direct|direct-ipv4|direct-ipv6|warp)
+      warn "该 tag 是内置出口，请换一个名称。"
+      return 1
+      ;;
+  esac
+  if jq -e --arg tag "$tag" 'any(.outbounds[]?; .tag == $tag)' "$ROUTE_JSON" >/dev/null; then
+    read -rp "已存在同名出口，是否覆盖？[y/N] " yn || return 1
+    [[ "$yn" =~ ^[Yy]$ ]] || return 1
+  fi
+
+  echo "粘贴分享链接、sing-box outbound JSON，或输入包含 sing-box 配置的文件路径。"
+  read -r -p "节点配置: " raw || return 1
+  [[ -f "$raw" ]] && raw="$(cat "$raw")"
+
+  if printf '%s' "$raw" | jq -e 'type == "object" and ((.outbounds // empty) | type == "array")' >/dev/null 2>&1; then
+    echo "文件内可用 outbounds："
+    printf '%s' "$raw" | jq -r '.outbounds[]?.tag' | sed 's/^/  - /'
+    read -rp "选择要导入的源 tag: " src_tag || return 1
+    outbound="$(printf '%s' "$raw" | jq -c --arg src "$src_tag" --arg tag "$tag" '
+      .outbounds[] | select(.tag == $src) | .tag = $tag
+      | if (has("server") and (has("domain_resolver") | not)) then .domain_resolver = "dns-doh-primary" else . end
+    ' | head -n1)"
+  elif printf '%s' "$raw" | jq -e 'type == "object" and (.type | type == "string")' >/dev/null 2>&1; then
+    outbound="$(printf '%s' "$raw" | jq -c --arg tag "$tag" '
+      .tag = $tag
+      | if (has("server") and (has("domain_resolver") | not)) then .domain_resolver = "dns-doh-primary" else . end
+    ')"
+  else
+    outbound="$(share_link_to_outbound "$raw" "$tag" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "${outbound:-}" ]] || ! printf '%s' "$outbound" | jq -e 'type == "object" and (.type | type == "string") and (.tag | type == "string")' >/dev/null; then
+    warn "无法识别该节点配置。建议粘贴 sing-box outbound JSON，或使用本脚本输出的常见分享链接。"
+    return 1
+  fi
+
+  route_bak="$(mktemp)"
+  cp "$ROUTE_JSON" "$route_bak"
+  tmp="$(mktemp)"
+  if jq -c --argjson outbound "$outbound" '
+    .rules = (.rules // [])
+    | .rule_set = (.rule_set // [])
+    | .outbounds = (((.outbounds // []) | map(select(.tag != $outbound.tag))) + [$outbound])
+  ' "$ROUTE_JSON" > "$tmp"; then
+    mv "$tmp" "$ROUTE_JSON"
+    apply_custom_routing "$route_bak"
+  else
+    rm -f "$tmp"
+    cp "$route_bak" "$ROUTE_JSON"
+    warn "导入远程出口失败。"
+  fi
+  rm -f "$route_bak"
+}
+
+remove_custom_route_rule(){
+  ensure_route_file
+  local idx route_bak tmp
+  print_custom_routes
+  read -rp "输入要删除的规则编号: " idx || return 1
+  [[ "$idx" =~ ^[0-9]+$ ]] || { warn "编号无效"; return 1; }
+  idx=$((idx-1))
+  if ! jq -e --argjson idx "$idx" '(.rules // [])[$idx] != null' "$ROUTE_JSON" >/dev/null; then
+    warn "规则不存在。"
+    return 1
+  fi
+  route_bak="$(mktemp)"
+  cp "$ROUTE_JSON" "$route_bak"
+  tmp="$(mktemp)"
+  if jq -c --argjson idx "$idx" '
+    .rules = ((.rules // []) | del(.[$idx]))
+    | ([.rules[]?.rule_set[]?] | unique) as $used
+    | .rule_set = ((.rule_set // []) | map(. as $rs | select($used | index($rs.tag))))
+  ' "$ROUTE_JSON" > "$tmp"; then
+    mv "$tmp" "$ROUTE_JSON"
+    apply_custom_routing "$route_bak"
+  else
+    rm -f "$tmp"
+    cp "$route_bak" "$ROUTE_JSON"
+    warn "删除规则失败。"
+  fi
+  rm -f "$route_bak"
+}
+
+remove_custom_route_outbound(){
+  ensure_route_file
+  local tag route_bak tmp
+  print_custom_routes
+  read -rp "输入要删除的远程出口 tag: " tag || return 1
+  if jq -e --arg tag "$tag" 'any(.rules[]?; .outbound == $tag)' "$ROUTE_JSON" >/dev/null; then
+    warn "该出口仍被路由规则使用，请先删除对应规则。"
+    return 1
+  fi
+  if ! jq -e --arg tag "$tag" 'any(.outbounds[]?; .tag == $tag)' "$ROUTE_JSON" >/dev/null; then
+    warn "远程出口不存在。"
+    return 1
+  fi
+  route_bak="$(mktemp)"
+  cp "$ROUTE_JSON" "$route_bak"
+  tmp="$(mktemp)"
+  if jq -c --arg tag "$tag" '.outbounds = ((.outbounds // []) | map(select(.tag != $tag)))' "$ROUTE_JSON" > "$tmp"; then
+    mv "$tmp" "$ROUTE_JSON"
+    apply_custom_routing "$route_bak"
+  else
+    rm -f "$tmp"
+    cp "$route_bak" "$ROUTE_JSON"
+    warn "删除远程出口失败。"
+  fi
+  rm -f "$route_bak"
+}
+
+clear_custom_route_rules(){
+  ensure_route_file
+  local route_bak tmp yn
+  read -rp "确认清空所有自定义路由规则？导入出口会保留。[y/N] " yn || return 1
+  [[ "$yn" =~ ^[Yy]$ ]] || return 1
+  route_bak="$(mktemp)"
+  cp "$ROUTE_JSON" "$route_bak"
+  tmp="$(mktemp)"
+  if jq -c '.rules = [] | .rule_set = [] | .outbounds = (.outbounds // [])' "$ROUTE_JSON" > "$tmp"; then
+    mv "$tmp" "$ROUTE_JSON"
+    apply_custom_routing "$route_bak"
+  else
+    rm -f "$tmp"
+    cp "$route_bak" "$ROUTE_JSON"
+    warn "清空规则失败。"
+  fi
+  rm -f "$route_bak"
+}
+
+custom_route_menu(){
+  ensure_installed_or_hint || { read -rp "回车返回..." _ || true; return 0; }
+  ensure_route_file
+  while :; do
+    clear >/dev/null 2>&1 || true
+    hr
+    echo -e " ${C_CYAN}自定义路由配置${C_RESET}"
+    hr
+    print_custom_routes
+    hr
+    echo -e "  ${C_GREEN}1)${C_RESET} 添加网址 / geosite 路由规则"
+    echo -e "  ${C_GREEN}2)${C_RESET} 导入其他 VPS 出口节点"
+    echo -e "  ${C_YELLOW}3)${C_RESET} 删除路由规则"
+    echo -e "  ${C_YELLOW}4)${C_RESET} 删除导入出口"
+    echo -e "  ${C_RED}5)${C_RESET} 清空自定义路由规则"
+    echo -e "  ${C_RED}0)${C_RESET} 返回主菜单"
+    hr
+    read -rp "选择: " op || return 0
+    case "${op:-}" in
+      1) add_custom_route_rule; read -rp "回车继续..." _ || true ;;
+      2) import_custom_route_outbound; read -rp "回车继续..." _ || true ;;
+      3) remove_custom_route_rule; read -rp "回车继续..." _ || true ;;
+      4) remove_custom_route_outbound; read -rp "回车继续..." _ || true ;;
+      5) clear_custom_route_rules; read -rp "回车继续..." _ || true ;;
+      0|q|Q) return 0 ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
 # ===== BBR =====
 enable_bbr(){
   if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
@@ -1160,7 +1862,8 @@ banner(){
   echo -e "  ${C_GREEN}5)${C_RESET} 一键开启 BBR"
   echo -e "  ${C_YELLOW}6)${C_RESET} 更新 sing-box 版本"
   echo -e "  ${C_YELLOW}7)${C_RESET} 一键网络诊断"
-  echo -e "  ${C_RED}8)${C_RESET} 卸载"
+  echo -e "  ${C_GREEN}8)${C_RESET} 自定义路由配置"
+  echo -e "  ${C_RED}9)${C_RESET} 卸载"
   echo -e "  ${C_RED}0)${C_RESET} 退出"
   hr
 }
@@ -1205,6 +1908,18 @@ run_diagnostics(){
       "$DNS_HEALTH_BIN" --probe
     else
       echo "DNS 健康检查脚本尚未安装，请重新执行部署。"
+    fi
+    echo
+
+    echo "== 自定义路由 =="
+    if [[ -s "$ROUTE_JSON" ]]; then
+      jq -r '
+        "rules=" + (((.rules // []) | length) | tostring),
+        "rule_set=" + (((.rule_set // []) | length) | tostring),
+        "imported_outbounds=" + (((.outbounds // []) | length) | tostring)
+      ' "$ROUTE_JSON" 2>/dev/null || echo "自定义路由文件无法解析。"
+    else
+      echo "未配置自定义路由。"
     fi
     echo
 
@@ -1397,7 +2112,8 @@ menu(){
     5) enable_bbr; read -rp "回车返回..." _ || true; menu ;;
     6) update_singbox; read -rp "回车返回..." _ || true; menu ;;
     7) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
-    8) uninstall_all ;; # 直接退出
+    8) custom_route_menu; menu ;;
+    9) uninstall_all ;; # 直接退出
     0|q|Q) exit 0 ;;
     *) echo -e "${C_YELLOW}无效选项，请重新选择${C_RESET}"; sleep 1; menu ;;
   esac
