@@ -9,6 +9,7 @@
 - **新版兼容**：配置生成已迁移到 sing-box 1.13+ 可用的 DNS 服务器格式和 WireGuard endpoint
 - **连接稳定性**：TCP keepalive、可配置 UDP timeout、WARP 25 秒保活
 - **DNS 故障切换**：Cloudflare DoH → Google DoH → UDP 备用 DNS
+- **自定义路由**：按域名 / geosite 指定本机 WARP、本机 IPv4、本机 IPv6 或导入的远程 VPS 节点出口
 - **运行诊断**：一键生成网络报告，并持久记录服务重启和 DNS 切换
 - **全自动化**：依赖安装、证书生成、防火墙配置、BBR 加速
 - **多发行版支持**：Debian/Ubuntu、CentOS/RHEL、Arch、openSUSE
@@ -44,7 +45,8 @@ bash sbp.sh
 | 5 | 一键开启 BBR |
 | 6 | 更新 sing-box 版本 |
 | 7 | 一键网络诊断 |
-| 8 | 卸载 |
+| 8 | 自定义路由配置 |
+| 9 | 卸载 |
 | 0 | 退出 |
 
 ## 节点说明
@@ -57,6 +59,25 @@ bash sbp.sh
 - 解锁 Netflix、Disney+ 等流媒体
 - 规避服务器 IP 被封锁
 
+### 自定义路由
+
+菜单 `8) 自定义路由配置` 可按目标网站指定出口：
+
+- 本机 WARP：例如让 `geosite:netflix` 走 WARP
+- 本机 IPv4 / IPv6：例如让 `suffix:openai.com` 固定走 IPv4 或 IPv6
+- 导入远程 VPS 节点：可粘贴 sing-box outbound JSON，或本脚本生成的常见分享链接（VLESS、Trojan、Hysteria2、VMess、Shadowsocks、TUIC、AnyTLS）
+
+匹配项支持逗号或空格分隔：
+
+```text
+geosite:netflix, suffix:openai.com, domain:example.com, keyword:google
+```
+
+简写规则：
+
+- `netflix` 会按 `geosite:netflix` 处理
+- `example.com` 会按 `suffix:example.com` 处理
+
 ## 配置文件位置
 
 | 文件 | 路径 |
@@ -65,6 +86,7 @@ bash sbp.sh
 | 凭证信息 | `/opt/sing-box/creds.env` |
 | 端口信息 | `/opt/sing-box/ports.env` |
 | WARP 配置 | `/opt/sing-box/warp.env` |
+| 自定义路由 | `/opt/sing-box/routes.json` |
 | 证书 | `/opt/sing-box/cert/` |
 | 重启记录 | `/opt/sing-box/restart.log` |
 | DNS 切换记录 | `/opt/sing-box/dns-health.log` |
