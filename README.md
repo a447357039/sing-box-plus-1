@@ -11,7 +11,8 @@
 - **DNS 故障切换**：Cloudflare DoH → Google DoH → UDP 备用 DNS
 - **自定义路由**：按域名 / geosite 指定本机 WARP、本机 IPv4、本机 IPv6 或导入的远程 VPS 节点出口
 - **运行诊断**：一键生成网络报告，并持久记录服务重启和 DNS 切换
-- **全自动化**：依赖安装、证书生成、防火墙配置、BBR 加速
+- **证书可选**：支持自签证书、手动指定公开有效证书，以及 ACME 自动申请和续期
+- **全自动化**：依赖安装、证书配置、防火墙配置、BBR 加速
 - **多发行版支持**：Debian/Ubuntu、CentOS/RHEL、Arch、openSUSE
 
 ## 系统要求
@@ -91,6 +92,20 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google
 | 重启记录 | `/opt/sing-box/restart.log` |
 | DNS 切换记录 | `/opt/sing-box/dns-health.log` |
 | 网络诊断报告 | `/opt/sing-box/diagnostics/` |
+
+## TLS 证书模式
+
+部署时可为 Hysteria2、Hysteria2 obfs、TUIC 和 AnyTLS 选择以下模式：
+
+1. **自签证书**：默认模式，分享链接使用服务器 IP，并包含 `insecure=1&allowInsecure=1`。
+2. **手动证书**：先将公开 CA 签发的 `fullchain.pem` 和未加密私钥上传到服务器，再输入证书域名及两个文件的绝对路径。脚本会检查有效期、域名、证书链以及证书和私钥是否匹配。
+3. **ACME 自动申请**：输入已解析到服务器公网 IP 的域名，脚本使用 sing-box 内置 ACME 向 Let's Encrypt 申请并自动续期。
+
+手动证书或 ACME 模式启用后，上述协议的分享链接会改用证书域名，并移除 `insecure` / `allowInsecure`，恢复客户端证书验证。Reality、VMess 和 Shadowsocks 节点不受此设置影响。
+
+> ACME 域名应使用 DNS only（关闭 CDN/反向代理），并确保 TCP 80 可用；若 80 已占用，脚本会尝试使用 TCP 443 的 TLS-ALPN 验证。云平台安全组中的对应端口仍需手动放行。
+
+如需切换证书模式，重新运行 `1) 安装/部署` 即可；已有凭证和端口会保留。
 
 ## 环境变量
 
