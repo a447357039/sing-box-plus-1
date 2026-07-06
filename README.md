@@ -32,11 +32,15 @@
 
 ## 🚀 快速开始
 
-```bash
-# 方法一：wget（推荐）
-wget -O sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh && bash sbp.sh
+方法一：wget（推荐）
 
-# 方法二：curl
+```bash
+wget -O sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh && bash sbp.sh
+```
+
+方法二：curl
+
+```bash
 curl -fsSL -o sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh && bash sbp.sh
 ```
 
