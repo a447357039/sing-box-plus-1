@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v2.7.0
+#  Version: v2.8.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -294,6 +294,17 @@ ENABLE_SS=${ENABLE_SS:-true}
 ENABLE_TUIC=${ENABLE_TUIC:-true}
 ENABLE_ANYTLS=${ENABLE_ANYTLS:-true}
 
+# TLS 证书模式：self_signed（默认）/ manual（手动证书）/ acme（自动申请）
+TLS_CERT_MODE=${TLS_CERT_MODE:-self_signed}
+TLS_DOMAIN=${TLS_DOMAIN:-}
+TLS_CERT_PATH=${TLS_CERT_PATH:-$CERT_DIR/fullchain.pem}
+TLS_KEY_PATH=${TLS_KEY_PATH:-$CERT_DIR/key.pem}
+TLS_ACME_EMAIL=${TLS_ACME_EMAIL:-}
+TLS_ACME_PROVIDER=${TLS_ACME_PROVIDER:-letsencrypt}
+TLS_ACME_DATA_DIR=${TLS_ACME_DATA_DIR:-$CERT_DIR/acme}
+TLS_ACME_DISABLE_HTTP_CHALLENGE=${TLS_ACME_DISABLE_HTTP_CHALLENGE:-false}
+TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=${TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE:-true}
+
 # 连接稳定性参数（均可在运行脚本前通过环境变量覆盖）
 SBP_TCP_KEEP_ALIVE_OVERRIDE=${TCP_KEEP_ALIVE-}
 SBP_TCP_KEEP_ALIVE_INTERVAL_OVERRIDE=${TCP_KEEP_ALIVE_INTERVAL-}
@@ -308,7 +319,7 @@ DNS_HEALTH_INTERVAL=${DNS_HEALTH_INTERVAL:-2m}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v2.7.0"
+SCRIPT_VERSION="v2.8.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -572,6 +583,16 @@ UDP_TIMEOUT=$UDP_TIMEOUT
 WARP_KEEPALIVE_INTERVAL=$WARP_KEEPALIVE_INTERVAL
 DNS_HEALTH_INTERVAL=$DNS_HEALTH_INTERVAL
 EOF
+  # 用户输入的域名、邮箱和路径使用 shell 转义，避免 env.conf 被特殊字符破坏。
+  printf 'TLS_CERT_MODE=%q\n' "$TLS_CERT_MODE" >> "$SB_DIR/env.conf"
+  printf 'TLS_DOMAIN=%q\n' "$TLS_DOMAIN" >> "$SB_DIR/env.conf"
+  printf 'TLS_CERT_PATH=%q\n' "$TLS_CERT_PATH" >> "$SB_DIR/env.conf"
+  printf 'TLS_KEY_PATH=%q\n' "$TLS_KEY_PATH" >> "$SB_DIR/env.conf"
+  printf 'TLS_ACME_EMAIL=%q\n' "$TLS_ACME_EMAIL" >> "$SB_DIR/env.conf"
+  printf 'TLS_ACME_PROVIDER=%q\n' "$TLS_ACME_PROVIDER" >> "$SB_DIR/env.conf"
+  printf 'TLS_ACME_DATA_DIR=%q\n' "$TLS_ACME_DATA_DIR" >> "$SB_DIR/env.conf"
+  printf 'TLS_ACME_DISABLE_HTTP_CHALLENGE=%q\n' "$TLS_ACME_DISABLE_HTTP_CHALLENGE" >> "$SB_DIR/env.conf"
+  printf 'TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=%q\n' "$TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE" >> "$SB_DIR/env.conf"
 }
 load_env(){ safe_source_env "$SB_DIR/env.conf" || true; }
 
@@ -906,13 +927,215 @@ gen_uuid(){
 }
 gen_reality(){ "$BIN_PATH" generate reality-keypair; }
 
-mk_cert(){
-  local crt="$CERT_DIR/fullchain.pem" key="$CERT_DIR/key.pem"
-  if [[ ! -s "$crt" || ! -s "$key" ]]; then
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes \
-      -keyout "$key" -out "$crt" -subj "/CN=$REALITY_SERVER" \
-      -addext "subjectAltName=DNS:$REALITY_SERVER" >/dev/null 2>&1
+valid_tls_domain(){
+  local domain="${1%.}"
+  (( ${#domain} <= 253 )) || return 1
+  [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
+}
+
+tls_ca_bundle(){
+  local bundle
+  for bundle in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    [[ -s "$bundle" ]] && { printf '%s' "$bundle"; return 0; }
+  done
+  return 1
+}
+
+validate_manual_certificate(){
+  local quiet="${1:-false}" cert_pub key_pub bundle
+  local fail_prefix="手动证书校验失败："
+
+  if ! valid_tls_domain "$TLS_DOMAIN"; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}域名格式无效"
+    return 1
   fi
+  if [[ "$TLS_CERT_PATH" != /* || ! -r "$TLS_CERT_PATH" || ! -s "$TLS_CERT_PATH" ]]; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书路径必须是可读的绝对路径：$TLS_CERT_PATH"
+    return 1
+  fi
+  if [[ "$TLS_KEY_PATH" != /* || ! -r "$TLS_KEY_PATH" || ! -s "$TLS_KEY_PATH" ]]; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}私钥路径必须是可读的绝对路径：$TLS_KEY_PATH"
+    return 1
+  fi
+  if ! openssl x509 -in "$TLS_CERT_PATH" -noout >/dev/null 2>&1; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书不是有效的 PEM X.509 文件"
+    return 1
+  fi
+  if ! openssl pkey -in "$TLS_KEY_PATH" -noout >/dev/null 2>&1; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}私钥不是可直接读取的 PEM 文件（不支持带密码私钥）"
+    return 1
+  fi
+  if ! openssl x509 -in "$TLS_CERT_PATH" -noout -checkend 0 >/dev/null 2>&1; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书已经过期或尚未生效"
+    return 1
+  fi
+  if ! openssl x509 -in "$TLS_CERT_PATH" -noout -checkhost "$TLS_DOMAIN" >/dev/null 2>&1; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书不包含域名 $TLS_DOMAIN"
+    return 1
+  fi
+
+  cert_pub="$(openssl x509 -in "$TLS_CERT_PATH" -pubkey -noout 2>/dev/null \
+    | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null)"
+  key_pub="$(openssl pkey -in "$TLS_KEY_PATH" -pubout -outform DER 2>/dev/null \
+    | openssl dgst -sha256 2>/dev/null)"
+  if [[ -z "$cert_pub" || "$cert_pub" != "$key_pub" ]]; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书与私钥不匹配"
+    return 1
+  fi
+
+  bundle="$(tls_ca_bundle || true)"
+  if [[ -z "$bundle" ]] || ! openssl verify -purpose sslserver -CAfile "$bundle" \
+      -untrusted "$TLS_CERT_PATH" "$TLS_CERT_PATH" >/dev/null 2>&1; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}无法验证到系统信任的公开 CA，请提供包含中间证书的 fullchain"
+    return 1
+  fi
+  return 0
+}
+
+tcp_port_is_listening(){
+  local port="$1"
+  ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$"
+}
+
+tls_domain_points_to_server(){
+  local domain="$1" public_ip
+  public_ip="$(get_ip)"
+  [[ "$public_ip" != "127.0.0.1" ]] || return 1
+  getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | grep -Fqx "$public_ip"
+}
+
+configure_tls_certificate(){
+  local choice default_choice domain cert_path key_path email
+  ensure_dirs
+  load_env || true
+  case "$TLS_CERT_MODE" in
+    manual) default_choice=2 ;;
+    acme) default_choice=3 ;;
+    *) default_choice=1 ;;
+  esac
+
+  echo
+  echo -e "${C_CYAN}${C_BOLD}TLS 证书配置${C_RESET}（用于 Hysteria2 / TUIC / AnyTLS）"
+  echo "  1) 自签证书（客户端需要允许不安全，默认）"
+  echo "  2) 使用已上传的公开有效证书"
+  echo "  3) 使用 ACME 自动申请和续期"
+  read -rp "选择 [${default_choice}]: " choice || return 1
+  choice="${choice:-$default_choice}"
+
+  case "$choice" in
+    1)
+      TLS_CERT_MODE=self_signed
+      TLS_DOMAIN=""
+      TLS_CERT_PATH="$CERT_DIR/fullchain.pem"
+      TLS_KEY_PATH="$CERT_DIR/key.pem"
+      TLS_ACME_EMAIL=""
+      ;;
+    2)
+      read -rp "证书域名（例如 vpn.example.com）: " domain || return 1
+      domain="${domain%.}"; domain="${domain,,}"
+      read -erp "fullchain.pem 绝对路径: " cert_path || return 1
+      read -erp "私钥绝对路径: " key_path || return 1
+      TLS_CERT_MODE=manual
+      TLS_DOMAIN="$domain"
+      TLS_CERT_PATH="$cert_path"
+      TLS_KEY_PATH="$key_path"
+      validate_manual_certificate || return 1
+      if ! tls_domain_points_to_server "$domain"; then
+        warn "未检测到 $domain 的 IPv4 A 记录指向本机公网 IPv4，生成的域名节点可能无法连接。"
+        read -rp "确认 DNS 已正确配置并继续？[y/N]: " choice || return 1
+        [[ "$choice" =~ ^[yY]$ ]] || return 1
+      fi
+      ;;
+    3)
+      read -rp "申请证书的域名（需已解析到本机，且关闭 CDN 代理）: " domain || return 1
+      domain="${domain%.}"; domain="${domain,,}"
+      valid_tls_domain "$domain" || { warn "域名格式无效：$domain"; return 1; }
+      read -rp "ACME 联系邮箱（可留空）: " email || return 1
+      if [[ -n "$email" && ! "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+        warn "邮箱格式无效"
+        return 1
+      fi
+      if ! tls_domain_points_to_server "$domain"; then
+        warn "未检测到 $domain 的 IPv4 A 记录指向本机公网 IPv4，ACME 申请或节点连接可能失败。"
+        read -rp "确认 DNS 已正确配置并继续？[y/N]: " choice || return 1
+        [[ "$choice" =~ ^[yY]$ ]] || return 1
+      fi
+
+      # 优先只使用 HTTP-01；80 被占用时再回退到 TLS-ALPN-01，避免挑战端口冲突。
+      if ! tcp_port_is_listening 80; then
+        TLS_ACME_DISABLE_HTTP_CHALLENGE=false
+        TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=true
+      elif ! tcp_port_is_listening 443; then
+        TLS_ACME_DISABLE_HTTP_CHALLENGE=true
+        TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=false
+      else
+        warn "80 和 443 TCP 端口均被占用，内置 ACME 无法启动验证监听器"
+        return 1
+      fi
+      TLS_CERT_MODE=acme
+      TLS_DOMAIN="$domain"
+      TLS_CERT_PATH=""
+      TLS_KEY_PATH=""
+      TLS_ACME_EMAIL="$email"
+      TLS_ACME_PROVIDER=letsencrypt
+      TLS_ACME_DATA_DIR="$CERT_DIR/acme"
+      ;;
+    *)
+      warn "无效的证书模式"
+      return 1
+      ;;
+  esac
+
+  save_env
+  info "TLS 证书模式已设置为：$TLS_CERT_MODE${TLS_DOMAIN:+（$TLS_DOMAIN）}"
+}
+
+mk_cert(){
+  local crt="$TLS_CERT_PATH" key="$TLS_KEY_PATH"
+  if [[ ! -s "$crt" || ! -s "$key" ]]; then
+    if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes \
+      -keyout "$key" -out "$crt" -subj "/CN=$REALITY_SERVER" \
+      -addext "subjectAltName=DNS:$REALITY_SERVER" >/dev/null 2>&1; then
+      warn "生成自签证书失败"
+      return 1
+    fi
+  fi
+  if ! openssl x509 -in "$crt" -noout >/dev/null 2>&1 \
+      || ! openssl pkey -in "$key" -noout >/dev/null 2>&1; then
+    warn "自签证书或私钥无法读取：$crt / $key"
+    return 1
+  fi
+  chmod 600 "$key" 2>/dev/null || true
+}
+
+prepare_tls_certificate(){
+  case "$TLS_CERT_MODE" in
+    self_signed)
+      TLS_CERT_PATH="$CERT_DIR/fullchain.pem"
+      TLS_KEY_PATH="$CERT_DIR/key.pem"
+      mk_cert
+      ;;
+    manual)
+      validate_manual_certificate || return 1
+      ;;
+    acme)
+      valid_tls_domain "$TLS_DOMAIN" || { warn "ACME 域名无效：$TLS_DOMAIN"; return 1; }
+      mkdir -p "$TLS_ACME_DATA_DIR"
+      chmod 700 "$TLS_ACME_DATA_DIR" 2>/dev/null || true
+      ;;
+    *)
+      warn "未知 TLS 证书模式：$TLS_CERT_MODE"
+      return 1
+      ;;
+  esac
+}
+
+tls_uses_public_certificate(){
+  case "$TLS_CERT_MODE" in
+    acme) valid_tls_domain "$TLS_DOMAIN" ;;
+    manual) validate_manual_certificate true ;;
+    *) return 1 ;;
+  esac
 }
 
 ensure_creds(){
@@ -1282,19 +1505,24 @@ write_config(){
   ensure_dirs; load_env || true; load_creds || true; load_ports || true
   apply_runtime_overrides
   normalize_runtime_settings
-  ensure_creds; save_all_ports; mk_cert
+  ensure_creds; save_all_ports; prepare_tls_certificate || return 1
   [[ "$ENABLE_WARP" == "true" ]] && ensure_warp_profile || true
 
-  local CRT="$CERT_DIR/fullchain.pem" KEY="$CERT_DIR/key.pem"
-  local ROUTING_JSON BIND4 BIND6
+  local CRT="$TLS_CERT_PATH" KEY="$TLS_KEY_PATH"
+  local ROUTING_JSON BIND4 BIND6 TMP_CONF
   ROUTING_JSON="$(load_route_json)"
   BIND4="$(default_ipv4_address || true)"
   BIND6="$(default_ipv6_address || true)"
-  jq -n \
+  TMP_CONF="$(mktemp "$SB_DIR/config.json.tmp.XXXXXX")" || return 1
+  if ! jq -n \
   --arg RS "$REALITY_SERVER" --argjson RSP "${REALITY_SERVER_PORT:-443}" --arg UID "$UUID" \
   --arg RPR "$REALITY_PRIV" --arg RPB "$REALITY_PUB" --arg SID "$REALITY_SID" \
   --arg HY2 "$HY2_PWD" --arg HY22 "$HY2_PWD2" --arg HY2O "$HY2_OBFS_PWD" \
   --arg GRPC "$GRPC_SERVICE" --arg VMWS "$VMESS_WS_PATH" --arg CRT "$CRT" --arg KEY "$KEY" \
+  --arg TLSMODE "$TLS_CERT_MODE" --arg TLSDOMAIN "$TLS_DOMAIN" \
+  --arg ACMEEMAIL "$TLS_ACME_EMAIL" --arg ACMEPROVIDER "$TLS_ACME_PROVIDER" --arg ACMEDATA "$TLS_ACME_DATA_DIR" \
+  --argjson ACMEDISABLEHTTP "$TLS_ACME_DISABLE_HTTP_CHALLENGE" \
+  --argjson ACMEDISABLETLS "$TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE" \
   --arg SS2022 "$SS2022_KEY" --arg SSPWD "$SS_PWD" --arg TUICUUID "$TUIC_UUID" --arg TUICPWD "$TUIC_PWD" \
   --arg ANYTLS "$ANYTLS_PWD" \
   --arg TCPKA "$TCP_KEEP_ALIVE" --arg TCPKAI "$TCP_KEEP_ALIVE_INTERVAL" --arg UDPT "$UDP_TIMEOUT" \
@@ -1313,16 +1541,28 @@ write_config(){
   --arg BIND4 "$BIND4" --arg BIND6 "$BIND6" --argjson CUSTOM_ROUTES "$ROUTING_JSON" \
   '
   def listen_tuning: {tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, udp_timeout:$UDPT};
+  def inbound_tls($alpn):
+    ({enabled:true}
+      + (if $TLSDOMAIN != "" then {server_name:$TLSDOMAIN} else {} end)
+      + (if ($alpn | length) > 0 then {alpn:$alpn} else {} end)
+      + (if $TLSMODE == "acme" then
+          {acme:{
+            domain:[$TLSDOMAIN], data_directory:$ACMEDATA, default_server_name:$TLSDOMAIN,
+            email:$ACMEEMAIL, provider:$ACMEPROVIDER,
+            disable_http_challenge:$ACMEDISABLEHTTP,
+            disable_tls_alpn_challenge:$ACMEDISABLETLS
+          }}
+        else {certificate_path:$CRT, key_path:$KEY} end));
   def inbound_vless($port): ({type:"vless", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}} + listen_tuning);
   def inbound_vless_flow($port): ({type:"vless", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID, flow:"xtls-rprx-vision"}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}} + listen_tuning);
   def inbound_trojan($port): ({type:"trojan", listen:"0.0.0.0", listen_port:$port, users:[{password:$UID}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}} + listen_tuning);
-  def inbound_hy2($port): ({type:"hysteria2", listen:"0.0.0.0", listen_port:$port, users:[{name:"hy2", password:$HY2}], tls:{enabled:true, certificate_path:$CRT, key_path:$KEY}} + listen_tuning);
+  def inbound_hy2($port): ({type:"hysteria2", listen:"0.0.0.0", listen_port:$port, users:[{name:"hy2", password:$HY2}], tls:inbound_tls([])} + listen_tuning);
   def inbound_vmess_ws($port): ({type:"vmess", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID}], transport:{type:"ws", path:$VMWS}} + listen_tuning);
-  def inbound_hy2_obfs($port): ({type:"hysteria2", listen:"0.0.0.0", listen_port:$port, users:[{name:"hy2", password:$HY22}], obfs:{type:"salamander", password:$HY2O}, tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h3"]}} + listen_tuning);
+  def inbound_hy2_obfs($port): ({type:"hysteria2", listen:"0.0.0.0", listen_port:$port, users:[{name:"hy2", password:$HY22}], obfs:{type:"salamander", password:$HY2O}, tls:inbound_tls(["h3"])} + listen_tuning);
   def inbound_ss2022($port): ({type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"2022-blake3-aes-256-gcm", password:$SS2022} + listen_tuning);
   def inbound_ss($port): ({type:"shadowsocks", listen:"0.0.0.0", listen_port:$port, method:"aes-256-gcm", password:$SSPWD} + listen_tuning);
-  def inbound_tuic($port): ({type:"tuic", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$TUICUUID, password:$TUICPWD}], congestion_control:"bbr", tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h3"]}} + listen_tuning);
-  def inbound_anytls($port): ({type:"anytls", listen:"0.0.0.0", listen_port:$port, users:[{name:"anytls", password:$ANYTLS}], tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h2","http/1.1"]}} + listen_tuning);
+  def inbound_tuic($port): ({type:"tuic", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$TUICUUID, password:$TUICPWD}], congestion_control:"bbr", tls:inbound_tls(["h3"])} + listen_tuning);
+  def inbound_anytls($port): ({type:"anytls", listen:"0.0.0.0", listen_port:$port, users:[{name:"anytls", password:$ANYTLS}], tls:inbound_tls(["h2","http/1.1"])} + listen_tuning);
 
   def warp_ready:
     $ENABLE_WARP=="true" and ($WPRIV|length)>0 and ($WPPUB|length)>0 and ($WHOST|length)>0 and ($WPORT>0) and (([$W4, $W6] | map(select(. != "")) | length)>0);
@@ -1432,7 +1672,21 @@ write_config(){
       + (if custom_uses_outbound("direct-ipv6") then [direct_ipv6_outbound] else [] end)
       + custom_outbounds),
     route: route_config
-  }' > "$CONF_JSON"
+  }' > "$TMP_CONF"; then
+    rm -f "$TMP_CONF"
+    warn "生成 sing-box JSON 配置失败，已保留原配置"
+    return 1
+  fi
+  if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$TMP_CONF"; then
+    rm -f "$TMP_CONF"
+    warn "sing-box 配置校验失败，已保留原配置"
+    return 1
+  fi
+  if ! mv -f "$TMP_CONF" "$CONF_JSON"; then
+    rm -f "$TMP_CONF"
+    warn "替换 sing-box 配置失败，已保留原配置"
+    return 1
+  fi
   save_env
 }
 
@@ -1445,6 +1699,10 @@ open_firewall(){
   rules+=("${PORT_VLESSR_W}/tcp" "${PORT_VLESS_GRPCR_W}/tcp" "${PORT_TROJANR_W}/tcp" "${PORT_VMESS_WS_W}/tcp")
   rules+=("${PORT_HY2_W}/udp" "${PORT_HY2_OBFS_W}/udp" "${PORT_TUIC_W}/udp" "${PORT_ANYTLS_W}/tcp")
   rules+=("${PORT_SS2022_W}/tcp" "${PORT_SS2022_W}/udp" "${PORT_SS_W}/tcp" "${PORT_SS_W}/udp")
+  if [[ "$TLS_CERT_MODE" == acme ]]; then
+    [[ "$TLS_ACME_DISABLE_HTTP_CHALLENGE" == false ]] && rules+=("80/tcp")
+    [[ "$TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE" == false ]] && rules+=("443/tcp")
+  fi
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q -E "active|活跃"; then
     for r in "${rules[@]}"; do ufw allow "$r" >/dev/null 2>&1 || true; done; ufw reload >/dev/null 2>&1 || true
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
@@ -1464,38 +1722,48 @@ open_firewall(){
 print_links_grouped(){
   load_env; load_creds; load_ports
   local ip; ip=$(get_ip)
+  local tls_host tls_security_query tls_tip
   local links_direct=() links_warp=()
+  if tls_uses_public_certificate; then
+    tls_host="$TLS_DOMAIN"
+    tls_security_query="sni=$(urlenc "$TLS_DOMAIN")"
+    tls_tip="Hysteria2 / TUIC / AnyTLS 已使用公开有效证书，分享链接将校验证书"
+  else
+    tls_host="$ip"
+    tls_security_query="insecure=1&allowInsecure=1&sni=$(urlenc "$REALITY_SERVER")"
+    tls_tip="Hysteria2 / TUIC / AnyTLS 使用自签证书，链接已带 allowInsecure=1"
+  fi
   # 直连10
   links_direct+=("vless://${UUID}@${ip}:${PORT_VLESSR}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality")
   links_direct+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality")
   links_direct+=("trojan://${UUID}@${ip}:${PORT_TROJANR}?security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality")
-  links_direct+=("hy2://$(urlenc "${HY2_PWD}")@${ip}:${PORT_HY2}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#hysteria2")
+  links_direct+=("hy2://$(urlenc "${HY2_PWD}")@${tls_host}:${PORT_HY2}?${tls_security_query}#hysteria2")
   local VMESS_JSON; VMESS_JSON=$(cat <<JSON
 {"v":"2","ps":"vmess-ws","add":"${ip}","port":"${PORT_VMESS_WS}","id":"${UUID}","aid":"0","net":"ws","type":"none","host":"","path":"${VMESS_WS_PATH}","tls":""}
 JSON
   )
   links_direct+=("vmess://$(printf "%s" "$VMESS_JSON" | b64enc)")
-  links_direct+=("hy2://$(urlenc "${HY2_PWD2}")@${ip}:${PORT_HY2_OBFS}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs")
+  links_direct+=("hy2://$(urlenc "${HY2_PWD2}")@${tls_host}:${PORT_HY2_OBFS}?${tls_security_query}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs")
   links_direct+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022}#ss2022")
   links_direct+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS}#ss")
-  links_direct+=("tuic://${UUID}:$(urlenc "${UUID}")@${ip}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#tuic-v5")
-  links_direct+=("anytls://$(urlenc "${ANYTLS_PWD}")@${ip}:${PORT_ANYTLS}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}&alpn=h2,http/1.1&fp=chrome#anytls")
+  links_direct+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5")
+  links_direct+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS}?${tls_security_query}&alpn=h2,http/1.1&fp=chrome#anytls")
 
   # WARP 10
   links_warp+=("vless://${UUID}@${ip}:${PORT_VLESSR_W}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-warp")
   links_warp+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR_W}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality-warp")
   links_warp+=("trojan://${UUID}@${ip}:${PORT_TROJANR_W}?security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality-warp")
-  links_warp+=("hy2://$(urlenc "${HY2_PWD}")@${ip}:${PORT_HY2_W}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#hysteria2-warp")
+  links_warp+=("hy2://$(urlenc "${HY2_PWD}")@${tls_host}:${PORT_HY2_W}?${tls_security_query}#hysteria2-warp")
   local VMESS_JSON_W; VMESS_JSON_W=$(cat <<JSON
 {"v":"2","ps":"vmess-ws-warp","add":"${ip}","port":"${PORT_VMESS_WS_W}","id":"${UUID}","aid":"0","net":"ws","type":"none","host":"","path":"${VMESS_WS_PATH}","tls":""}
 JSON
   )
   links_warp+=("vmess://$(printf "%s" "$VMESS_JSON_W" | b64enc)")
-  links_warp+=("hy2://$(urlenc "${HY2_PWD2}")@${ip}:${PORT_HY2_OBFS_W}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs-warp")
+  links_warp+=("hy2://$(urlenc "${HY2_PWD2}")@${tls_host}:${PORT_HY2_OBFS_W}?${tls_security_query}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs-warp")
   links_warp+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022_W}#ss2022-warp")
   links_warp+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS_W}#ss-warp")
-  links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${ip}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#tuic-v5-warp")
-  links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${ip}:${PORT_ANYTLS_W}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}&alpn=h2,http/1.1&fp=chrome#anytls-warp")
+  links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5-warp")
+  links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS_W}?${tls_security_query}&alpn=h2,http/1.1&fp=chrome#anytls-warp")
 
   echo -e "${C_BLUE}${C_BOLD}分享链接（20 个）${C_RESET}"
   hr
@@ -1504,7 +1772,7 @@ JSON
   hr
   echo -e "${C_CYAN}${C_BOLD}【WARP 节点（10）】${C_RESET}（同上 10 种，带 -warp）"
   echo -e "${C_DIM}说明：带 -warp 的 10 个节点走 Cloudflare WARP 出口，流媒体解锁更友好${C_RESET}"
-  echo -e "${C_DIM}提示：TUIC / AnyTLS 默认 allowInsecure=1，v2rayN 等客户端导入后如不识别 AnyTLS 链接，可手动按端口和密码添加${C_RESET}"
+  echo -e "${C_DIM}提示：${tls_tip}；客户端如不识别 AnyTLS 链接，可手动按域名、端口、SNI 和密码添加${C_RESET}"
   for l in "${links_warp[@]}"; do echo "  $l"; done
   hr
 }
@@ -2044,13 +2312,14 @@ uninstall_all(){
 deploy_native(){
   install_deps
   install_singbox
+  configure_tls_certificate
   write_config
   info "检查配置 ..."
   "$BIN_PATH" check -c "$CONF_JSON"
   info "写入并启用 systemd 服务 ..."
   write_systemd
-  systemctl restart "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
   open_firewall
+  systemctl restart "${SYSTEMD_SERVICE}" || die "sing-box 启动失败"
   echo; echo -e "${C_BOLD}${C_GREEN}★ 部署完成（20 节点）${C_RESET}"; echo
   # 打印链接并直接退出
   print_links_grouped
@@ -2083,6 +2352,10 @@ menu(){
   echo -e "${C_BLUE}[信息] 正在检查 sing-box 安装状态...${C_RESET}"
   if ! install_singbox; then
     echo -e "${C_RED}[错误] sing-box 安装失败${C_RESET}"
+    exit 1
+  fi
+  if ! configure_tls_certificate; then
+    echo -e "${C_RED}[错误] TLS 证书配置未完成${C_RESET}"
     exit 1
   fi
   ensure_warp_profile        || true
@@ -2121,4 +2394,3 @@ menu(){
 
 # ===== 入口 =====
 menu
-
