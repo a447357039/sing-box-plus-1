@@ -1728,6 +1728,12 @@ print_links_grouped(){
     tls_host="$TLS_DOMAIN"
     tls_security_query="sni=$(urlenc "$TLS_DOMAIN")"
     tls_tip="Hysteria2 / TUIC / AnyTLS 已使用公开有效证书，分享链接将校验证书"
+  elif [[ "$TLS_CERT_MODE" != "self_signed" && -n "$TLS_DOMAIN" ]]; then
+    # 用户配置了自己的域名（manual/acme），即使证书校验未通过也使用该域名作为 SNI，
+    # 保持与服务端 inbound_tls 中 server_name 一致，避免 SNI 不匹配报错。
+    tls_host="$TLS_DOMAIN"
+    tls_security_query="insecure=1&allowInsecure=1&sni=$(urlenc "$TLS_DOMAIN")"
+    tls_tip="Hysteria2 / TUIC / AnyTLS 使用自有域名证书（校验降级），链接已带 allowInsecure=1"
   else
     tls_host="$ip"
     tls_security_query="insecure=1&allowInsecure=1&sni=$(urlenc "$REALITY_SERVER")"
