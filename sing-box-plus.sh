@@ -311,15 +311,21 @@ SBP_TCP_KEEP_ALIVE_INTERVAL_OVERRIDE=${TCP_KEEP_ALIVE_INTERVAL-}
 SBP_UDP_TIMEOUT_OVERRIDE=${UDP_TIMEOUT-}
 SBP_WARP_KEEPALIVE_INTERVAL_OVERRIDE=${WARP_KEEPALIVE_INTERVAL-}
 SBP_DNS_HEALTH_INTERVAL_OVERRIDE=${DNS_HEALTH_INTERVAL-}
+SBP_DNS_FAILURE_THRESHOLD_OVERRIDE=${DNS_FAILURE_THRESHOLD-}
+SBP_DNS_RECOVERY_THRESHOLD_OVERRIDE=${DNS_RECOVERY_THRESHOLD-}
+SBP_DNS_SWITCH_COOLDOWN_OVERRIDE=${DNS_SWITCH_COOLDOWN-}
 TCP_KEEP_ALIVE=${TCP_KEEP_ALIVE:-30s}
 TCP_KEEP_ALIVE_INTERVAL=${TCP_KEEP_ALIVE_INTERVAL:-30s}
 UDP_TIMEOUT=${UDP_TIMEOUT:-10m}
 WARP_KEEPALIVE_INTERVAL=${WARP_KEEPALIVE_INTERVAL:-25}
 DNS_HEALTH_INTERVAL=${DNS_HEALTH_INTERVAL:-2m}
+DNS_FAILURE_THRESHOLD=${DNS_FAILURE_THRESHOLD:-3}
+DNS_RECOVERY_THRESHOLD=${DNS_RECOVERY_THRESHOLD:-5}
+DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v2.8.0"
+SCRIPT_VERSION="v2.8.1"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -346,6 +352,9 @@ apply_runtime_overrides(){
   [[ -n "$SBP_UDP_TIMEOUT_OVERRIDE" ]] && UDP_TIMEOUT=$SBP_UDP_TIMEOUT_OVERRIDE
   [[ -n "$SBP_WARP_KEEPALIVE_INTERVAL_OVERRIDE" ]] && WARP_KEEPALIVE_INTERVAL=$SBP_WARP_KEEPALIVE_INTERVAL_OVERRIDE
   [[ -n "$SBP_DNS_HEALTH_INTERVAL_OVERRIDE" ]] && DNS_HEALTH_INTERVAL=$SBP_DNS_HEALTH_INTERVAL_OVERRIDE
+  [[ -n "$SBP_DNS_FAILURE_THRESHOLD_OVERRIDE" ]] && DNS_FAILURE_THRESHOLD=$SBP_DNS_FAILURE_THRESHOLD_OVERRIDE
+  [[ -n "$SBP_DNS_RECOVERY_THRESHOLD_OVERRIDE" ]] && DNS_RECOVERY_THRESHOLD=$SBP_DNS_RECOVERY_THRESHOLD_OVERRIDE
+  [[ -n "$SBP_DNS_SWITCH_COOLDOWN_OVERRIDE" ]] && DNS_SWITCH_COOLDOWN=$SBP_DNS_SWITCH_COOLDOWN_OVERRIDE
   return 0
 }
 
@@ -358,6 +367,21 @@ normalize_runtime_settings(){
      (( WARP_KEEPALIVE_INTERVAL < 1 || WARP_KEEPALIVE_INTERVAL > 65535 )); then
     warn "WARP_KEEPALIVE_INTERVAL 无效，已恢复为 25"
     WARP_KEEPALIVE_INTERVAL=25
+  fi
+  if [[ ! "$DNS_FAILURE_THRESHOLD" =~ ^[0-9]+$ ]] ||
+     (( DNS_FAILURE_THRESHOLD < 1 || DNS_FAILURE_THRESHOLD > 100 )); then
+    warn "DNS_FAILURE_THRESHOLD 无效，已恢复为 3"
+    DNS_FAILURE_THRESHOLD=3
+  fi
+  if [[ ! "$DNS_RECOVERY_THRESHOLD" =~ ^[0-9]+$ ]] ||
+     (( DNS_RECOVERY_THRESHOLD < 1 || DNS_RECOVERY_THRESHOLD > 100 )); then
+    warn "DNS_RECOVERY_THRESHOLD 无效，已恢复为 5"
+    DNS_RECOVERY_THRESHOLD=5
+  fi
+  if [[ ! "$DNS_SWITCH_COOLDOWN" =~ ^[0-9]+$ ]] ||
+     (( DNS_SWITCH_COOLDOWN < 0 || DNS_SWITCH_COOLDOWN > 86400 )); then
+    warn "DNS_SWITCH_COOLDOWN 无效，已恢复为 600"
+    DNS_SWITCH_COOLDOWN=600
   fi
 }
 
@@ -582,6 +606,9 @@ TCP_KEEP_ALIVE_INTERVAL=$TCP_KEEP_ALIVE_INTERVAL
 UDP_TIMEOUT=$UDP_TIMEOUT
 WARP_KEEPALIVE_INTERVAL=$WARP_KEEPALIVE_INTERVAL
 DNS_HEALTH_INTERVAL=$DNS_HEALTH_INTERVAL
+DNS_FAILURE_THRESHOLD=$DNS_FAILURE_THRESHOLD
+DNS_RECOVERY_THRESHOLD=$DNS_RECOVERY_THRESHOLD
+DNS_SWITCH_COOLDOWN=$DNS_SWITCH_COOLDOWN
 EOF
   # 用户输入的域名、邮箱和路径使用 shell 转义，避免 env.conf 被特殊字符破坏。
   printf 'TLS_CERT_MODE=%q\n' "$TLS_CERT_MODE" >> "$SB_DIR/env.conf"
@@ -1331,6 +1358,23 @@ MODE=${1:-check}
 [[ -f "$SB_DIR/env.conf" ]] && source "$SB_DIR/env.conf"
 [[ -s "$CONF_JSON" ]] || exit 0
 mkdir -p "$SB_DIR"
+DNS_HEALTH_STATE=${DNS_HEALTH_STATE:-$SB_DIR/dns-health.state}
+DNS_FAILURE_THRESHOLD=${DNS_FAILURE_THRESHOLD:-3}
+DNS_RECOVERY_THRESHOLD=${DNS_RECOVERY_THRESHOLD:-5}
+DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
+if [[ ! "$DNS_FAILURE_THRESHOLD" =~ ^[0-9]+$ ]] ||
+   (( DNS_FAILURE_THRESHOLD < 1 || DNS_FAILURE_THRESHOLD > 100 )); then
+  DNS_FAILURE_THRESHOLD=3
+fi
+if [[ ! "$DNS_RECOVERY_THRESHOLD" =~ ^[0-9]+$ ]] ||
+   (( DNS_RECOVERY_THRESHOLD < 1 || DNS_RECOVERY_THRESHOLD > 100 )); then
+  DNS_RECOVERY_THRESHOLD=5
+fi
+if [[ ! "$DNS_SWITCH_COOLDOWN" =~ ^[0-9]+$ ]] ||
+   (( DNS_SWITCH_COOLDOWN < 0 || DNS_SWITCH_COOLDOWN > 86400 )); then
+  DNS_SWITCH_COOLDOWN=600
+fi
+umask 077
 
 log_event(){
   printf '%s %s\n' "$(date '+%F %T %z')" "$*" >> "$DNS_HEALTH_LOG"
@@ -1340,6 +1384,50 @@ log_event(){
     tail -n 1000 "$DNS_HEALTH_LOG" > "${DNS_HEALTH_LOG}.tmp" &&
       mv "${DNS_HEALTH_LOG}.tmp" "$DNS_HEALTH_LOG"
   fi
+}
+
+read_state(){
+  STATE_PENDING_DNS=""
+  STATE_PENDING_COUNT=0
+  STATE_LAST_SWITCH=0
+  [[ -s "$DNS_HEALTH_STATE" ]] || return 0
+
+  local key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      pending_dns)
+        case "$value" in
+          dns-doh-primary|dns-doh-backup|dns-udp-fallback) STATE_PENDING_DNS=$value ;;
+        esac
+        ;;
+      pending_count)
+        [[ "$value" =~ ^[0-9]+$ ]] && STATE_PENDING_COUNT=$value
+        ;;
+      last_switch)
+        [[ "$value" =~ ^[0-9]+$ ]] && STATE_LAST_SWITCH=$value
+        ;;
+    esac
+  done < "$DNS_HEALTH_STATE"
+}
+
+write_state(){
+  local tmp="${DNS_HEALTH_STATE}.$$"
+  if ! printf 'pending_dns=%s\npending_count=%s\nlast_switch=%s\n' \
+      "$STATE_PENDING_DNS" "$STATE_PENDING_COUNT" "$STATE_LAST_SWITCH" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$DNS_HEALTH_STATE"
+}
+
+dns_rank(){
+  case "$1" in
+    dns-doh-primary) echo 0 ;;
+    dns-doh-backup) echo 1 ;;
+    dns-udp-fallback) echo 2 ;;
+    *) echo 99 ;;
+  esac
 }
 
 probe_cloudflare(){
@@ -1384,7 +1472,50 @@ else
 fi
 
 current=$(jq -r '.dns.final // "dns-doh-primary"' "$CONF_JSON" 2>/dev/null)
-[[ "$current" == "$selected" ]] && exit 0
+read_state
+
+if [[ "$current" == "$selected" ]]; then
+  if [[ -n "$STATE_PENDING_DNS" || "$STATE_PENDING_COUNT" -ne 0 ]]; then
+    STATE_PENDING_DNS=""
+    STATE_PENDING_COUNT=0
+    write_state || log_event "DNS 状态保存失败：无法清除待切换状态"
+  fi
+  exit 0
+fi
+
+current_rank=$(dns_rank "$current")
+selected_rank=$(dns_rank "$selected")
+if (( selected_rank < current_rank )); then
+  transition="恢复"
+  threshold=$DNS_RECOVERY_THRESHOLD
+else
+  transition="故障转移"
+  threshold=$DNS_FAILURE_THRESHOLD
+fi
+
+if [[ "$STATE_PENDING_DNS" == "$selected" ]]; then
+  (( STATE_PENDING_COUNT += 1 ))
+else
+  STATE_PENDING_DNS=$selected
+  STATE_PENDING_COUNT=1
+fi
+
+if (( STATE_PENDING_COUNT < threshold )); then
+  write_state || log_event "DNS 状态保存失败：无法记录待切换状态"
+  log_event "DNS ${transition}待确认：$current -> $selected（${STATE_PENDING_COUNT}/${threshold}）"
+  exit 0
+fi
+
+now=$(date +%s)
+if [[ "$transition" == "恢复" ]] && (( STATE_LAST_SWITCH > 0 )); then
+  elapsed=$(( now - STATE_LAST_SWITCH ))
+  if (( elapsed < DNS_SWITCH_COOLDOWN )); then
+    remaining=$(( DNS_SWITCH_COOLDOWN - elapsed ))
+    write_state || log_event "DNS 状态保存失败：无法记录冷却状态"
+    log_event "DNS 恢复等待冷却：$current -> $selected（剩余 ${remaining}s）"
+    exit 0
+  fi
+fi
 
 tmp="${CONF_JSON}.dns-health.$$"
 if ! jq --arg dns "$selected" '
@@ -1411,7 +1542,11 @@ fi
 
 chmod 600 "$tmp"
 mv "$tmp" "$CONF_JSON"
-log_event "DNS 切换：$current -> $selected"
+STATE_PENDING_DNS=""
+STATE_PENDING_COUNT=0
+STATE_LAST_SWITCH=$now
+write_state || log_event "DNS 状态保存失败：配置已切换但无法记录状态"
+log_event "DNS 切换：$current -> $selected（${transition}，阈值 ${threshold}）"
 
 if [[ "$MODE" != "--no-restart" ]] && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
   systemctl restart "$SYSTEMD_SERVICE"
@@ -2210,6 +2345,8 @@ run_diagnostics(){
     echo "TCP keepalive: ${TCP_KEEP_ALIVE}/${TCP_KEEP_ALIVE_INTERVAL}"
     echo "UDP timeout: ${UDP_TIMEOUT}"
     echo "WARP keepalive: ${WARP_KEEPALIVE_INTERVAL}s"
+    echo "DNS 切换阈值: 故障 ${DNS_FAILURE_THRESHOLD} 次 / 恢复 ${DNS_RECOVERY_THRESHOLD} 次"
+    echo "DNS 恢复冷却: ${DNS_SWITCH_COOLDOWN}s"
     conntrack_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
     conntrack_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
     echo "Conntrack: ${conntrack_count:-未知}/${conntrack_max:-未知}"
