@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v2.8.0
+#  Version: v2.8.2
 # ============================================================
 
 set -Eeuo pipefail
@@ -279,6 +279,8 @@ DNS_HEALTH_BIN=${DNS_HEALTH_BIN:-/usr/local/sbin/sing-box-plus-dns-health}
 EVENT_LOG_BIN=${EVENT_LOG_BIN:-/usr/local/sbin/sing-box-plus-event}
 DNS_HEALTH_SERVICE=${DNS_HEALTH_SERVICE:-sing-box-plus-dns-health.service}
 DNS_HEALTH_TIMER=${DNS_HEALTH_TIMER:-sing-box-plus-dns-health.timer}
+SYSTEMD_UNIT_DIR=${SYSTEMD_UNIT_DIR:-/etc/systemd/system}
+SBP_SCRIPT_PATH=${SBP_SCRIPT_PATH:-/root/sbp.sh}
 ROUTE_JSON=${ROUTE_JSON:-$SB_DIR/routes.json}
 
 # 功能开关（保持稳定默认）
@@ -325,7 +327,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v2.8.1"
+SCRIPT_VERSION="v2.8.2"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -1342,9 +1344,9 @@ install_singbox() {
 
 # ===== 运行时辅助：DNS 健康切换与服务事件记录 =====
 write_runtime_helpers(){
-  mkdir -p "$(dirname "$DNS_HEALTH_BIN")" "$(dirname "$EVENT_LOG_BIN")"
+  mkdir -p "$(dirname "$DNS_HEALTH_BIN")" "$(dirname "$EVENT_LOG_BIN")" "$SYSTEMD_UNIT_DIR" || return 1
 
-  cat > "$DNS_HEALTH_BIN" <<'EOF'
+  cat > "$DNS_HEALTH_BIN" <<'EOF' || return 1
 #!/usr/bin/env bash
 set -uo pipefail
 
@@ -1553,7 +1555,7 @@ if [[ "$MODE" != "--no-restart" ]] && systemctl is-active --quiet "$SYSTEMD_SERV
 fi
 EOF
 
-  cat > "$EVENT_LOG_BIN" <<'EOF'
+  cat > "$EVENT_LOG_BIN" <<'EOF' || return 1
 #!/usr/bin/env bash
 set -uo pipefail
 
@@ -1573,9 +1575,9 @@ if (( lines > 2000 )); then
 fi
 EOF
 
-  chmod 0755 "$DNS_HEALTH_BIN" "$EVENT_LOG_BIN"
+  chmod 0755 "$DNS_HEALTH_BIN" "$EVENT_LOG_BIN" || return 1
 
-  cat > "/etc/systemd/system/${DNS_HEALTH_SERVICE}" <<EOF
+  cat > "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_SERVICE}" <<EOF || return 1
 [Unit]
 Description=Sing-Box-Plus DNS health check
 After=network-online.target
@@ -1588,7 +1590,7 @@ Environment=SYSTEMD_SERVICE=${SYSTEMD_SERVICE}
 ExecStart=${DNS_HEALTH_BIN}
 EOF
 
-  cat > "/etc/systemd/system/${DNS_HEALTH_TIMER}" <<EOF
+  cat > "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_TIMER}" <<EOF || return 1
 [Unit]
 Description=Run Sing-Box-Plus DNS health check periodically
 
@@ -1602,12 +1604,14 @@ Unit=${DNS_HEALTH_SERVICE}
 [Install]
 WantedBy=timers.target
 EOF
+  chmod 0644 "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_SERVICE}" "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_TIMER}" || return 1
+  return 0
 }
 
 # ===== systemd =====
 write_systemd(){
 write_runtime_helpers
-cat > "/etc/systemd/system/${SYSTEMD_SERVICE}" <<EOF
+cat > "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" <<EOF
 [Unit]
 Description=Sing-Box (Native 20 nodes)
 After=network-online.target
@@ -2443,8 +2447,8 @@ uninstall_all(){
   systemctl stop "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
   systemctl disable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
   systemctl disable --now "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/${SYSTEMD_SERVICE}"
-  rm -f "/etc/systemd/system/${DNS_HEALTH_SERVICE}" "/etc/systemd/system/${DNS_HEALTH_TIMER}"
+  rm -f "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}"
+  rm -f "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_SERVICE}" "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_TIMER}"
   rm -f "$DNS_HEALTH_BIN" "$EVENT_LOG_BIN"
   systemctl daemon-reload
   rm -rf "$SB_DIR"
@@ -2475,6 +2479,222 @@ ensure_installed_or_hint(){
     return 1
   fi
   return 0
+}
+
+# ===== 已有节点轻量更新 =====
+backup_runtime_file(){
+  local source_path=$1 backup_name=$2 backup_dir=$3
+  if [[ -e "$source_path" || -L "$source_path" ]]; then
+    cp -a -- "$source_path" "$backup_dir/$backup_name" || return 1
+  else
+    : > "$backup_dir/${backup_name}.missing" || return 1
+  fi
+}
+
+restore_runtime_file(){
+  local backup_dir=$1 backup_name=$2 target_path=$3
+  if [[ -e "$backup_dir/$backup_name" || -L "$backup_dir/$backup_name" ]]; then
+    mkdir -p "$(dirname "$target_path")" || return 1
+    cp -a -- "$backup_dir/$backup_name" "$target_path" || return 1
+  elif [[ -f "$backup_dir/${backup_name}.missing" ]]; then
+    rm -f -- "$target_path" || return 1
+  fi
+}
+
+backup_runtime_update(){
+  local backup_dir=$1
+  backup_runtime_file "$SBP_SCRIPT_PATH" management-script "$backup_dir" || return 1
+  backup_runtime_file "$DNS_HEALTH_BIN" dns-health-helper "$backup_dir" || return 1
+  backup_runtime_file "$EVENT_LOG_BIN" event-log-helper "$backup_dir" || return 1
+  backup_runtime_file "$SB_DIR/env.conf" env.conf "$backup_dir" || return 1
+  backup_runtime_file "$CONF_JSON" config.json "$backup_dir" || return 1
+  backup_runtime_file "$SB_DIR/creds.env" creds.env "$backup_dir" || return 1
+  backup_runtime_file "$SB_DIR/ports.env" ports.env "$backup_dir" || return 1
+  backup_runtime_file "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_SERVICE}" dns-health.service "$backup_dir" || return 1
+  backup_runtime_file "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_TIMER}" dns-health.timer "$backup_dir" || return 1
+}
+
+restore_runtime_update(){
+  local backup_dir=$1 timer_was_active=$2 restore_failed=0
+
+  systemctl stop "$DNS_HEALTH_TIMER" >/dev/null 2>&1 || true
+  systemctl stop "$DNS_HEALTH_SERVICE" >/dev/null 2>&1 || true
+  restore_runtime_file "$backup_dir" management-script "$SBP_SCRIPT_PATH" || restore_failed=1
+  restore_runtime_file "$backup_dir" dns-health-helper "$DNS_HEALTH_BIN" || restore_failed=1
+  restore_runtime_file "$backup_dir" event-log-helper "$EVENT_LOG_BIN" || restore_failed=1
+  restore_runtime_file "$backup_dir" env.conf "$SB_DIR/env.conf" || restore_failed=1
+  restore_runtime_file "$backup_dir" dns-health.service "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_SERVICE}" || restore_failed=1
+  restore_runtime_file "$backup_dir" dns-health.timer "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_TIMER}" || restore_failed=1
+  systemctl daemon-reload >/dev/null 2>&1 || restore_failed=1
+
+  if [[ "$timer_was_active" == true ]]; then
+    systemctl start "$DNS_HEALTH_TIMER" >/dev/null 2>&1 || restore_failed=1
+  else
+    systemctl stop "$DNS_HEALTH_TIMER" >/dev/null 2>&1 || true
+  fi
+  return "$restore_failed"
+}
+
+update_runtime_env(){
+  local env_file="$SB_DIR/env.conf" tmp_file
+  tmp_file=$(mktemp "${env_file}.tmp.XXXXXX") || return 1
+
+  if [[ -f "$env_file" ]]; then
+    awk '
+      !/^[[:space:]]*(export[[:space:]]+)?DNS_FAILURE_THRESHOLD=/ &&
+      !/^[[:space:]]*(export[[:space:]]+)?DNS_RECOVERY_THRESHOLD=/ &&
+      !/^[[:space:]]*(export[[:space:]]+)?DNS_SWITCH_COOLDOWN=/ { print }
+    ' "$env_file" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+  fi
+
+  printf 'DNS_FAILURE_THRESHOLD=%s\nDNS_RECOVERY_THRESHOLD=%s\nDNS_SWITCH_COOLDOWN=%s\n' \
+    "$DNS_FAILURE_THRESHOLD" "$DNS_RECOVERY_THRESHOLD" "$DNS_SWITCH_COOLDOWN" >> "$tmp_file" || {
+      rm -f "$tmp_file"
+      return 1
+    }
+
+  if [[ -f "$env_file" ]]; then
+    chmod --reference="$env_file" "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chown --reference="$env_file" "$tmp_file" 2>/dev/null || true
+  else
+    chmod 0600 "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+  fi
+  mv -f -- "$tmp_file" "$env_file" || { rm -f "$tmp_file"; return 1; }
+}
+
+singbox_main_pid(){
+  local pid
+  pid=$(systemctl show "$SYSTEMD_SERVICE" --property MainPID --value 2>/dev/null) || pid=unknown
+  [[ "$pid" =~ ^[0-9]+$ ]] || pid=unknown
+  printf '%s\n' "$pid"
+}
+
+apply_runtime_update(){
+  local script_source=$1 timer_was_active=$2 pid_before=$3 script_tmp pid_after
+
+  mkdir -p "$SB_DIR" "$(dirname "$SBP_SCRIPT_PATH")" "$SYSTEMD_UNIT_DIR" || return 1
+  script_tmp=$(mktemp "${SBP_SCRIPT_PATH}.tmp.XXXXXX") || return 1
+  if ! install -m 0755 "$script_source" "$script_tmp"; then
+    rm -f "$script_tmp"
+    return 1
+  fi
+  if ! mv -f -- "$script_tmp" "$SBP_SCRIPT_PATH"; then
+    rm -f "$script_tmp"
+    return 1
+  fi
+
+  update_runtime_env || return 1
+  write_runtime_helpers || return 1
+  bash -n "$DNS_HEALTH_BIN" || return 1
+  bash -n "$EVENT_LOG_BIN" || return 1
+  systemctl daemon-reload || return 1
+  "$DNS_HEALTH_BIN" --probe || return 1
+
+  pid_after=$(singbox_main_pid)
+  if [[ "$pid_before" != unknown && "$pid_after" != "$pid_before" ]]; then
+    echo "[ERROR] 更新过程中 sing-box MainPID 发生变化：${pid_before} -> ${pid_after}" >&2
+    return 1
+  fi
+
+  if [[ "$timer_was_active" == true ]]; then
+    systemctl start "$DNS_HEALTH_TIMER" || return 1
+  fi
+
+  pid_after=$(singbox_main_pid)
+  if [[ "$pid_before" != unknown && "$pid_after" != "$pid_before" ]]; then
+    echo "[ERROR] 恢复 DNS 定时器后 sing-box MainPID 发生变化：${pid_before} -> ${pid_after}" >&2
+    return 1
+  fi
+  return 0
+}
+
+update_runtime_components(){
+  [[ "$EUID" -eq 0 ]] || die "轻量更新需要 root 权限，请使用 sudo 运行"
+  [[ "$SBP_SCRIPT_PATH" == /* ]] || die "SBP_SCRIPT_PATH 必须是绝对路径"
+  [[ "$SYSTEMD_UNIT_DIR" == /* ]] || die "SYSTEMD_UNIT_DIR 必须是绝对路径"
+  [[ -s "$CONF_JSON" ]] || die "未发现已有节点配置：$CONF_JSON"
+
+  local script_source=${BASH_SOURCE[0]} backup_root backup_dir timestamp
+  local timer_was_active=false timer_was_enabled=false pid_before old_umask
+  if command -v readlink >/dev/null 2>&1; then
+    script_source=$(readlink -f "$script_source") || die "无法解析当前脚本路径"
+  else
+    script_source="$(cd "$(dirname "$script_source")" && pwd)/$(basename "$script_source")"
+  fi
+  bash -n "$script_source" || die "当前脚本语法检查失败，未执行更新"
+
+  load_env
+  apply_runtime_overrides
+  normalize_runtime_settings
+  [[ -s "$CONF_JSON" ]] || die "env.conf 指向的节点配置不存在：$CONF_JSON"
+
+  mkdir -p "$SB_DIR" || die "无法访问安装目录：$SB_DIR"
+  exec 8>"$SB_DIR/.runtime-update.lock"
+  flock -n 8 || die "另一个轻量更新正在进行，请稍后重试"
+
+  old_umask=$(umask)
+  umask 077
+  backup_root="$SB_DIR/backups"
+  mkdir -p "$backup_root" || die "无法创建备份目录：$backup_root"
+  timestamp=$(date +%Y%m%d-%H%M%S)
+  backup_dir=$(mktemp -d "$backup_root/runtime-update-${timestamp}.XXXXXX") || die "无法创建更新备份"
+  chmod 0700 "$backup_dir" || die "无法保护更新备份目录"
+
+  systemctl is-active --quiet "$DNS_HEALTH_TIMER" && timer_was_active=true
+  systemctl is-enabled --quiet "$DNS_HEALTH_TIMER" && timer_was_enabled=true
+  pid_before=$(singbox_main_pid)
+
+  if ! backup_runtime_update "$backup_dir"; then
+    umask "$old_umask"
+    die "运行时文件备份失败：$backup_dir"
+  fi
+
+  if [[ "$timer_was_active" == true ]]; then
+    systemctl stop "$DNS_HEALTH_TIMER" || {
+      systemctl start "$DNS_HEALTH_TIMER" >/dev/null 2>&1 || true
+      umask "$old_umask"
+      die "无法暂停 DNS 健康检查定时器，未执行更新"
+    }
+  fi
+  systemctl stop "$DNS_HEALTH_SERVICE" >/dev/null 2>&1 || true
+
+  if ! apply_runtime_update "$script_source" "$timer_was_active" "$pid_before"; then
+    warn "轻量更新失败，正在恢复备份"
+    if restore_runtime_update "$backup_dir" "$timer_was_active"; then
+      warn "已恢复更新前的运行时文件"
+    else
+      warn "自动恢复不完整，请从以下目录手动恢复：$backup_dir"
+    fi
+    umask "$old_umask"
+    return 1
+  fi
+
+  umask "$old_umask"
+  info "轻量更新完成：${SCRIPT_VERSION}"
+  info "管理脚本：$SBP_SCRIPT_PATH"
+  info "备份目录：$backup_dir"
+  if [[ "$pid_before" == unknown ]]; then
+    warn "systemd 未返回 sing-box MainPID，无法自动核对主服务进程"
+  else
+    info "sing-box MainPID 未变化：$pid_before"
+  fi
+  if [[ "$timer_was_active" == true ]]; then
+    info "DNS 健康检查定时器已恢复运行（启用状态：${timer_was_enabled}）"
+  else
+    info "DNS 健康检查定时器原本未运行，已保持不运行（启用状态：${timer_was_enabled}）"
+  fi
+}
+
+usage(){
+  cat <<EOF
+用法：
+  bash sbp.sh                    打开交互式管理菜单
+  sudo bash sbp.sh --update-runtime
+                                 轻量更新管理脚本与 DNS 运行时组件
+  bash sbp.sh --help             显示本帮助
+
+轻量更新不会改写节点配置、凭证或端口，也不会主动重启 sing-box。
+EOF
 }
 
 # ===== 菜单 =====
@@ -2536,4 +2756,17 @@ menu(){
 }
 
 # ===== 入口 =====
-menu
+main(){
+  case "${1:-}" in
+    "") menu ;;
+    --update-runtime) update_runtime_components ;;
+    -h|--help) usage ;;
+    *)
+      echo "未知参数：$1" >&2
+      usage >&2
+      return 1
+      ;;
+  esac
+}
+
+main "$@"
