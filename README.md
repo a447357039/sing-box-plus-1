@@ -48,6 +48,31 @@ curl -fsSL -o sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/m
 
 ---
 
+## ♻️ 已有服务器轻量更新
+
+已部署节点的服务器可以只更新管理脚本、DNS 健康检查辅助脚本和定时器配置：
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh \
+  -o /tmp/sbp.sh
+bash -n /tmp/sbp.sh
+sudo bash /tmp/sbp.sh --update-runtime
+```
+
+该命令会把当前脚本安装到 `/root/sbp.sh`，并将更新前的文件备份到
+`/opt/sing-box/backups/runtime-update-*`。它不会改写 `config.json`、节点凭证或端口，
+也不会主动重启 `sing-box.service`；DNS 定时器原本未运行时会保持不运行。
+
+以后可直接运行 `/root/sbp.sh` 打开管理菜单。若要覆盖防抖默认值，可在更新时传入：
+
+```bash
+sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
+  DNS_SWITCH_COOLDOWN=900 bash /tmp/sbp.sh --update-runtime
+```
+
+---
+
 ## 📖 菜单功能
 
 ```
@@ -148,6 +173,8 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google, regex:.*
 | 重启记录 | `/opt/sing-box/restart.log` | 服务启停日志 |
 | DNS 切换记录 | `/opt/sing-box/dns-health.log` | DNS 上游切换日志 |
 | 诊断报告 | `/opt/sing-box/diagnostics/` | 网络诊断快照 |
+| 管理脚本 | `/root/sbp.sh` | 轻量更新后安装的脚本入口 |
+| 更新备份 | `/opt/sing-box/backups/` | 轻量更新前的运行时文件快照 |
 
 ---
 

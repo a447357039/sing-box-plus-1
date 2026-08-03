@@ -13,7 +13,7 @@ command -v jq >/dev/null 2>&1 || {
 
 helper="$test_root/dns-health"
 awk '
-  $0 == "  cat > \"$DNS_HEALTH_BIN\" <<'\''EOF'\''" { capture=1; next }
+  $0 ~ /^  cat > "\$DNS_HEALTH_BIN" <<'\''EOF'\''/ { capture=1; next }
   capture && $0 == "EOF" { exit }
   capture { print }
 ' "$main_script" > "$helper"
