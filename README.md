@@ -13,7 +13,7 @@
 | **20 节点** | 10 直连 + 10 WARP 出口，每种协议各一个，互不冲突 |
 | **10 种协议** | VLESS Reality · VLESS gRPC Reality · Trojan Reality · Hysteria2 · VMess WS · Hysteria2 obfs · SS2022 · Shadowsocks · TUIC v5 · AnyTLS |
 | **WARP 出口** | Cloudflare WARP 线路，解锁 Netflix / Disney+ 等流媒体更友好 |
-| **DNS 故障切换** | Cloudflare DoH → Google DoH → UDP 1.0.0.1，systemd timer 定期检测并自动切换 |
+| **DNS 故障切换** | Cloudflare DoH → Google DoH → UDP 1.0.0.1，连续失败确认与恢复冷却避免探测抖动重启 |
 | **自定义路由** | 按域名 / geosite 规则指定 WARP、本机 IPv4/IPv6、或导入的远程 VPS 出口 |
 | **TLS 证书** | 自签证书 / 手动上传公开有效证书 / ACME 自动申请续期，三种模式一键切换 |
 | **连接稳定** | TCP keepalive · 可调 UDP timeout · WARP 保活 · 全参数环境变量覆盖 |
@@ -167,7 +167,8 @@ SBP_BIN_ONLY=1 bash sbp.sh
 
 # 调整连接参数
 UDP_TIMEOUT=15m TCP_KEEP_ALIVE=30s TCP_KEEP_ALIVE_INTERVAL=30s \
-WARP_KEEPALIVE_INTERVAL=25 DNS_HEALTH_INTERVAL=2m bash sbp.sh
+WARP_KEEPALIVE_INTERVAL=25 DNS_HEALTH_INTERVAL=2m \
+DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sbp.sh
 ```
 
 | 变量 | 默认值 | 说明 |
@@ -181,6 +182,9 @@ WARP_KEEPALIVE_INTERVAL=25 DNS_HEALTH_INTERVAL=2m bash sbp.sh
 | `UDP_TIMEOUT` | `10m` | UDP NAT 过期时间 |
 | `WARP_KEEPALIVE_INTERVAL` | `25` | WARP WireGuard 保活间隔（秒） |
 | `DNS_HEALTH_INTERVAL` | `2m` | DNS 健康检查周期 |
+| `DNS_FAILURE_THRESHOLD` | `3` | 连续多少次探测确认后才切换到备用 DNS |
+| `DNS_RECOVERY_THRESHOLD` | `5` | 连续多少次探测确认后才恢复到优先 DNS |
+| `DNS_SWITCH_COOLDOWN` | `600` | 故障切换后恢复优先 DNS 的最短冷却时间（秒） |
 
 网络参数会持久保存到 `/opt/sing-box/env.conf`。
 
