@@ -87,22 +87,23 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
   6) 更新 sing-box 版本
   7) 一键网络诊断
   8) 自定义路由配置
-  9) 卸载
+  9) 域名、证书与 SNI
+ 10) 卸载
   0) 退出
 ═══════════════════════════════════════════════
 ```
 
 ---
 
-## 🔐 TLS 证书模式
+## 🔐 域名、证书与 SNI
 
-部署时为 **Hysteria2 / TUIC / AnyTLS** 选择以下模式之一：
+主菜单 `9) 域名、证书与 SNI` 可随时设置 **Hysteria2 / TUIC / AnyTLS** 的 TLS 证书，或修改 VLESS / Trojan Reality 使用的 SNI。部署流程不再重复询问证书设置；所有创建路径都直接使用已保存的配置。
 
 ### 1. 自签证书（默认）
 
-- 无需域名，开箱即用
-- 分享链接自动附带 `insecure=1&allowInsecure=1`
-- 客户端需允许不安全连接
+- 无需域名，可直接生成
+- 导入链接明确写入 `insecure=0`，不再输出旧的 `allowInsecure` 参数
+- 客户端必须先信任该自签证书，否则安全校验会拒绝连接
 
 ### 2. 手动上传证书
 
@@ -117,9 +118,13 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 - 使用 sing-box 内置 ACME 向 Let's Encrypt 申请证书并自动续期
 - 优先使用 TCP 80 端口 HTTP-01 验证；若 80 被占用，回退到 TCP 443 TLS-ALPN-01
 
-> 💡 手动证书或 ACME 模式启用后，Hysteria2 / TUIC / AnyTLS 的分享链接会改用证书域名，SNI 与服务端配置严格一致。VLESS Reality、Trojan Reality、VMess WS 和 Shadowsocks 节点不受此设置影响。
->
-> 如需切换证书模式，重新运行 `1) 安装/部署` 即可，已有凭证和端口会保留。
+### Reality SNI
+
+Reality SNI 可独立修改。脚本会同时更新服务端握手目标和 VLESS / Trojan Reality 导入链接；自签模式下还会重新签发与新 SNI 匹配的托管证书。
+
+已部署时，修改域名、证书或 SNI 后，脚本会先校验新配置，再重启正在运行的服务并刷新 `/opt/sing-box/share-links.txt`。生成或重启失败时会恢复原配置和托管证书。
+
+> 手动证书或 ACME 模式下，TLS 节点的地址和 SNI 始终使用证书域名。脚本不会再因证书异常自动降级到“允许不安全连接”。
 
 ---
 
@@ -167,6 +172,7 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google, regex:.*
 | 环境配置 | `/opt/sing-box/env.conf` | 运行参数与功能开关 |
 | 凭证信息 | `/opt/sing-box/creds.env` | UUID、密码、密钥 |
 | 端口信息 | `/opt/sing-box/ports.env` | 20 个端口分配 |
+| 导入链接 | `/opt/sing-box/share-links.txt` | 自动刷新的 20 个链接，仅 root 可读 |
 | WARP 配置 | `/opt/sing-box/warp.env` | WireGuard 密钥与端点 |
 | 自定义路由 | `/opt/sing-box/routes.json` | 用户自定义路由规则 |
 | 证书目录 | `/opt/sing-box/cert/` | TLS 证书与私钥 |
@@ -219,7 +225,7 @@ DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sb
 
 ## 📱 客户端导入
 
-安装完成后输出 20 个分享链接，可直接导入以下客户端：
+安装完成后会输出并保存 20 个分享链接到 `/opt/sing-box/share-links.txt`，可直接导入以下客户端：
 
 - **v2rayN** / **v2rayNG**
 - **Clash Meta** / **Mihomo**
@@ -236,10 +242,10 @@ DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sb
 <summary><b>Hysteria2 / TUIC / AnyTLS 报域名不匹配错误？</b></summary>
 
 确认证书模式和 SNI 一致：
-- **自签证书**：客户端需勾选「允许不安全连接」
+- **自签证书**：导入链接保持严格校验，需先在客户端信任该证书
 - **手动证书 / ACME**：确保域名 A 记录指向服务器 IP，脚本会自动将 SNI 设为与证书域名一致
 
-如已部署但仍报错，重新运行 `1) 安装/部署` 并重新配置证书即可。
+如已部署但仍报错，运行脚本并进入 `9) 域名、证书与 SNI` 修正设置；成功后服务配置和导入链接会自动更新。
 </details>
 
 <details>
