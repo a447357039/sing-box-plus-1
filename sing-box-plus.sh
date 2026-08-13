@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v2.8.2
+#  Version: v2.9.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -282,6 +282,7 @@ DNS_HEALTH_TIMER=${DNS_HEALTH_TIMER:-sing-box-plus-dns-health.timer}
 SYSTEMD_UNIT_DIR=${SYSTEMD_UNIT_DIR:-/etc/systemd/system}
 SBP_SCRIPT_PATH=${SBP_SCRIPT_PATH:-/root/sbp.sh}
 ROUTE_JSON=${ROUTE_JSON:-$SB_DIR/routes.json}
+SHARE_LINKS_FILE=${SHARE_LINKS_FILE:-$SB_DIR/share-links.txt}
 
 # 功能开关（保持稳定默认）
 ENABLE_WARP=${ENABLE_WARP:-true}
@@ -327,7 +328,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v2.8.2"
+SCRIPT_VERSION="v2.9.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -1045,7 +1046,7 @@ configure_tls_certificate(){
 
   echo
   echo -e "${C_CYAN}${C_BOLD}TLS 证书配置${C_RESET}（用于 Hysteria2 / TUIC / AnyTLS）"
-  echo "  1) 自签证书（客户端需要允许不安全，默认）"
+  echo "  1) 自签证书（默认；导入链接仍强制证书校验）"
   echo "  2) 使用已上传的公开有效证书"
   echo "  3) 使用 ACME 自动申请和续期"
   read -rp "选择 [${default_choice}]: " choice || return 1
@@ -1115,26 +1116,45 @@ configure_tls_certificate(){
       ;;
   esac
 
-  save_env
-  info "TLS 证书模式已设置为：$TLS_CERT_MODE${TLS_DOMAIN:+（$TLS_DOMAIN）}"
+  return 0
 }
 
 mk_cert(){
-  local crt="$TLS_CERT_PATH" key="$TLS_KEY_PATH"
-  if [[ ! -s "$crt" || ! -s "$key" ]]; then
-    if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes \
-      -keyout "$key" -out "$crt" -subj "/CN=$REALITY_SERVER" \
-      -addext "subjectAltName=DNS:$REALITY_SERVER" >/dev/null 2>&1; then
-      warn "生成自签证书失败"
-      return 1
+  local crt="$TLS_CERT_PATH" key="$TLS_KEY_PATH" tmp_dir cert_pub key_pub
+  local cert_name="$REALITY_SERVER"
+
+  if [[ -s "$crt" && -s "$key" ]] \
+      && openssl x509 -in "$crt" -noout -checkhost "$cert_name" >/dev/null 2>&1 \
+      && openssl pkey -in "$key" -noout >/dev/null 2>&1; then
+    cert_pub="$(openssl x509 -in "$crt" -pubkey -noout 2>/dev/null \
+      | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null)"
+    key_pub="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null \
+      | openssl dgst -sha256 2>/dev/null)"
+    if [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]; then
+      chmod 600 "$key" 2>/dev/null || true
+      return 0
     fi
   fi
-  if ! openssl x509 -in "$crt" -noout >/dev/null 2>&1 \
-      || ! openssl pkey -in "$key" -noout >/dev/null 2>&1; then
-    warn "自签证书或私钥无法读取：$crt / $key"
+
+  tmp_dir="$(mktemp -d "$CERT_DIR/.self-signed.XXXXXX")" || return 1
+  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes \
+      -keyout "$tmp_dir/key.pem" -out "$tmp_dir/fullchain.pem" -subj "/CN=$cert_name" \
+      -addext "subjectAltName=DNS:$cert_name" >/dev/null 2>&1 \
+      || ! openssl x509 -in "$tmp_dir/fullchain.pem" -noout -checkhost "$cert_name" >/dev/null 2>&1 \
+      || ! openssl pkey -in "$tmp_dir/key.pem" -noout >/dev/null 2>&1; then
+    rm -rf "$tmp_dir"
+    warn "生成自签证书失败"
     return 1
   fi
-  chmod 600 "$key" 2>/dev/null || true
+
+  chmod 600 "$tmp_dir/key.pem"
+  chmod 644 "$tmp_dir/fullchain.pem"
+  if ! mv -f "$tmp_dir/key.pem" "$key" || ! mv -f "$tmp_dir/fullchain.pem" "$crt"; then
+    rm -rf "$tmp_dir"
+    warn "写入自签证书失败：$crt / $key"
+    return 1
+  fi
+  rmdir "$tmp_dir" 2>/dev/null || true
 }
 
 prepare_tls_certificate(){
@@ -1861,22 +1881,20 @@ open_firewall(){
 print_links_grouped(){
   load_env; load_creds; load_ports
   local ip; ip=$(get_ip)
-  local tls_host tls_security_query tls_tip
+  local tls_host tls_security_query tls_tip links_tmp l
   local links_direct=() links_warp=()
-  if tls_uses_public_certificate; then
+  if [[ "$TLS_CERT_MODE" != "self_signed" && -n "$TLS_DOMAIN" ]]; then
     tls_host="$TLS_DOMAIN"
-    tls_security_query="sni=$(urlenc "$TLS_DOMAIN")"
-    tls_tip="Hysteria2 / TUIC / AnyTLS 已使用公开有效证书，分享链接将校验证书"
-  elif [[ "$TLS_CERT_MODE" != "self_signed" && -n "$TLS_DOMAIN" ]]; then
-    # 用户配置了自己的域名（manual/acme），即使证书校验未通过也使用该域名作为 SNI，
-    # 保持与服务端 inbound_tls 中 server_name 一致，避免 SNI 不匹配报错。
-    tls_host="$TLS_DOMAIN"
-    tls_security_query="insecure=1&allowInsecure=1&sni=$(urlenc "$TLS_DOMAIN")"
-    tls_tip="Hysteria2 / TUIC / AnyTLS 使用自有域名证书（校验降级），链接已带 allowInsecure=1"
+    tls_security_query="insecure=0&sni=$(urlenc "$TLS_DOMAIN")"
+    if tls_uses_public_certificate; then
+      tls_tip="Hysteria2 / TUIC / AnyTLS 已使用公开有效证书并强制校验证书"
+    else
+      tls_tip="证书当前无法通过公开 CA 校验；导入链接仍保持安全校验，修复证书前连接会失败"
+    fi
   else
     tls_host="$ip"
-    tls_security_query="insecure=1&allowInsecure=1&sni=$(urlenc "$REALITY_SERVER")"
-    tls_tip="Hysteria2 / TUIC / AnyTLS 使用自签证书，链接已带 allowInsecure=1"
+    tls_security_query="insecure=0&sni=$(urlenc "$REALITY_SERVER")"
+    tls_tip="Hysteria2 / TUIC / AnyTLS 使用自签证书且强制校验；客户端需先信任该证书"
   fi
   # 直连10
   links_direct+=("vless://${UUID}@${ip}:${PORT_VLESSR}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality")
@@ -1910,6 +1928,22 @@ JSON
   links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5-warp")
   links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS_W}?${tls_security_query}&alpn=h2,http/1.1&fp=chrome#anytls-warp")
 
+  mkdir -p "$(dirname "$SHARE_LINKS_FILE")"
+  links_tmp="$(mktemp "${SHARE_LINKS_FILE}.tmp.XXXXXX")" || {
+    warn "无法创建导入链接临时文件"
+    return 1
+  }
+  {
+    printf '%s\n' "${links_direct[@]}"
+    printf '%s\n' "${links_warp[@]}"
+  } > "$links_tmp"
+  chmod 600 "$links_tmp"
+  if ! mv -f "$links_tmp" "$SHARE_LINKS_FILE"; then
+    rm -f "$links_tmp"
+    warn "无法更新导入链接文件：$SHARE_LINKS_FILE"
+    return 1
+  fi
+
   echo -e "${C_BLUE}${C_BOLD}分享链接（20 个）${C_RESET}"
   hr
   echo -e "${C_CYAN}${C_BOLD}【直连节点（10）】${C_RESET}（vless-reality / vless-grpc-reality / trojan-reality / vmess-ws / hy2 / hy2-obfs / ss2022 / ss / tuic / anytls）"
@@ -1920,6 +1954,7 @@ JSON
   echo -e "${C_DIM}提示：${tls_tip}；客户端如不识别 AnyTLS 链接，可手动按域名、端口、SNI 和密码添加${C_RESET}"
   for l in "${links_warp[@]}"; do echo "  $l"; done
   hr
+  info "导入链接已更新：$SHARE_LINKS_FILE"
 }
 
 # ===== 自定义路由菜单 =====
@@ -2238,6 +2273,188 @@ custom_route_menu(){
   done
 }
 
+# ===== 域名、证书与 SNI =====
+tls_mode_label(){
+  case "$TLS_CERT_MODE" in
+    self_signed) echo "自签证书" ;;
+    manual) echo "手动证书" ;;
+    acme) echo "ACME 自动证书" ;;
+    *) echo "未知（$TLS_CERT_MODE）" ;;
+  esac
+}
+
+configure_reality_sni(){
+  local domain
+  load_env || true
+  read -rp "Reality SNI 域名 [${REALITY_SERVER}]: " domain || return 1
+  domain="${domain:-$REALITY_SERVER}"
+  domain="${domain%.}"
+  domain="${domain,,}"
+  valid_tls_domain "$domain" || {
+    warn "SNI 域名格式无效：$domain"
+    return 1
+  }
+  REALITY_SERVER="$domain"
+}
+
+restore_connection_files(){
+  local backup_dir="$1" had_env="$2" had_config="$3" had_cert="$4" had_key="$5"
+
+  if [[ "$had_env" == true ]]; then
+    cp -f "$backup_dir/env.conf" "$SB_DIR/env.conf"
+  else
+    rm -f "$SB_DIR/env.conf"
+  fi
+  if [[ "$had_config" == true ]]; then
+    cp -f "$backup_dir/config.json" "$CONF_JSON"
+  else
+    rm -f "$CONF_JSON"
+  fi
+  if [[ "$had_cert" == true ]]; then
+    cp -f "$backup_dir/fullchain.pem" "$CERT_DIR/fullchain.pem"
+  else
+    rm -f "$CERT_DIR/fullchain.pem"
+  fi
+  if [[ "$had_key" == true ]]; then
+    cp -f "$backup_dir/key.pem" "$CERT_DIR/key.pem"
+  else
+    rm -f "$CERT_DIR/key.pem"
+  fi
+}
+
+remove_connection_backup(){
+  local backup_dir="$1"
+  rm -f "$backup_dir/env.conf" "$backup_dir/config.json" \
+    "$backup_dir/fullchain.pem" "$backup_dir/key.pem"
+  rmdir "$backup_dir" 2>/dev/null || true
+}
+
+apply_connection_settings(){
+  local backup_dir had_env=false had_config=false had_cert=false had_key=false
+  local service_active=false
+  ensure_dirs
+  backup_dir="$(mktemp -d "$SB_DIR/.connection-settings.XXXXXX")" || return 1
+
+  if [[ -f "$SB_DIR/env.conf" ]]; then
+    cp -f "$SB_DIR/env.conf" "$backup_dir/env.conf" || { remove_connection_backup "$backup_dir"; return 1; }
+    had_env=true
+  fi
+  if [[ -f "$CONF_JSON" ]]; then
+    cp -f "$CONF_JSON" "$backup_dir/config.json" || { remove_connection_backup "$backup_dir"; return 1; }
+    had_config=true
+  fi
+  if [[ -f "$CERT_DIR/fullchain.pem" ]]; then
+    cp -f "$CERT_DIR/fullchain.pem" "$backup_dir/fullchain.pem" || { remove_connection_backup "$backup_dir"; return 1; }
+    had_cert=true
+  fi
+  if [[ -f "$CERT_DIR/key.pem" ]]; then
+    cp -f "$CERT_DIR/key.pem" "$backup_dir/key.pem" || { remove_connection_backup "$backup_dir"; return 1; }
+    had_key=true
+  fi
+
+  if ! save_env; then
+    restore_connection_files "$backup_dir" "$had_env" "$had_config" "$had_cert" "$had_key"
+    remove_connection_backup "$backup_dir"
+    warn "保存连接设置失败，已恢复原设置"
+    return 1
+  fi
+
+  if [[ "$had_config" != true ]]; then
+    remove_connection_backup "$backup_dir"
+    info "设置已保存，首次部署时会自动生效"
+    return 0
+  fi
+
+  if ! write_config; then
+    restore_connection_files "$backup_dir" "$had_env" "$had_config" "$had_cert" "$had_key"
+    remove_connection_backup "$backup_dir"
+    load_env || true
+    warn "更新服务配置失败，已恢复原设置"
+    return 1
+  fi
+
+  open_firewall || warn "防火墙规则更新失败，请手动检查端口"
+  if command -v systemctl >/dev/null 2>&1 \
+      && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
+    service_active=true
+  fi
+  if [[ "$service_active" == true ]] && ! systemctl restart "${SYSTEMD_SERVICE}"; then
+    restore_connection_files "$backup_dir" "$had_env" "$had_config" "$had_cert" "$had_key"
+    load_env || true
+    systemctl restart "${SYSTEMD_SERVICE}" >/dev/null 2>&1 \
+      || warn "原配置已恢复，但服务恢复启动失败"
+    remove_connection_backup "$backup_dir"
+    warn "服务重启失败，域名、证书与 SNI 设置已回滚"
+    return 1
+  fi
+
+  remove_connection_backup "$backup_dir"
+  if [[ "$service_active" == true ]]; then
+    info "连接设置已应用并重启服务"
+  else
+    info "连接设置已写入；服务当前未运行"
+  fi
+  print_links_grouped || warn "配置已生效，但导入链接文件更新失败"
+}
+
+edit_tls_certificate_settings(){
+  load_env || true
+  local old_mode="$TLS_CERT_MODE" old_domain="$TLS_DOMAIN"
+  local old_cert="$TLS_CERT_PATH" old_key="$TLS_KEY_PATH" old_email="$TLS_ACME_EMAIL"
+  local old_provider="$TLS_ACME_PROVIDER" old_data="$TLS_ACME_DATA_DIR"
+  local old_http="$TLS_ACME_DISABLE_HTTP_CHALLENGE" old_tls="$TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE"
+
+  if ! configure_tls_certificate || ! apply_connection_settings; then
+    TLS_CERT_MODE="$old_mode"
+    TLS_DOMAIN="$old_domain"
+    TLS_CERT_PATH="$old_cert"
+    TLS_KEY_PATH="$old_key"
+    TLS_ACME_EMAIL="$old_email"
+    TLS_ACME_PROVIDER="$old_provider"
+    TLS_ACME_DATA_DIR="$old_data"
+    TLS_ACME_DISABLE_HTTP_CHALLENGE="$old_http"
+    TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE="$old_tls"
+    return 1
+  fi
+}
+
+edit_reality_sni_setting(){
+  load_env || true
+  local old_server="$REALITY_SERVER"
+  if ! configure_reality_sni || ! apply_connection_settings; then
+    REALITY_SERVER="$old_server"
+    return 1
+  fi
+}
+
+connection_settings_menu(){
+  local op domain_text
+  while true; do
+    load_env || true
+    domain_text="${TLS_DOMAIN:-未设置}"
+    clear >/dev/null 2>&1 || true
+    hr
+    echo -e " ${C_CYAN}${C_BOLD}域名、证书与 SNI${C_RESET}"
+    hr
+    echo "  TLS 证书：$(tls_mode_label)"
+    echo "  证书域名：$domain_text"
+    echo "  Reality SNI：$REALITY_SERVER"
+    echo "  导入安全：强制证书校验"
+    hr
+    echo -e "  ${C_GREEN}1)${C_RESET} 设置 TLS 域名与证书"
+    echo -e "  ${C_GREEN}2)${C_RESET} 修改 Reality SNI 域名"
+    echo -e "  ${C_RED}0)${C_RESET} 返回主菜单"
+    hr
+    read -rp "选择: " op || return 0
+    case "${op:-}" in
+      1) edit_tls_certificate_settings || true; read -rp "回车继续..." _ || true ;;
+      2) edit_reality_sni_setting || true; read -rp "回车继续..." _ || true ;;
+      0|q|Q) return 0 ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
 # ===== BBR =====
 enable_bbr(){
   if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
@@ -2276,7 +2493,8 @@ banner(){
   echo -e "  ${C_YELLOW}6)${C_RESET} 更新 sing-box 版本"
   echo -e "  ${C_YELLOW}7)${C_RESET} 一键网络诊断"
   echo -e "  ${C_GREEN}8)${C_RESET} 自定义路由配置"
-  echo -e "  ${C_RED}9)${C_RESET} 卸载"
+  echo -e "  ${C_GREEN}9)${C_RESET} 域名、证书与 SNI"
+  echo -e "  ${C_RED}10)${C_RESET} 卸载"
   echo -e "  ${C_RED}0)${C_RESET} 退出"
   hr
 }
@@ -2439,6 +2657,7 @@ rotate_ports(){
   systemctl restart "${SYSTEMD_SERVICE}"
 
   info "已更换端口并重启。"
+  print_links_grouped || warn "端口已更新，但导入链接文件更新失败"
   read -p "回车返回..." _ || true
 }
 
@@ -2459,7 +2678,6 @@ uninstall_all(){
 deploy_native(){
   install_deps
   install_singbox
-  configure_tls_certificate
   write_config
   info "检查配置 ..."
   "$BIN_PATH" check -c "$CONF_JSON"
@@ -2717,10 +2935,6 @@ menu(){
     echo -e "${C_RED}[错误] sing-box 安装失败${C_RESET}"
     exit 1
   fi
-  if ! configure_tls_certificate; then
-    echo -e "${C_RED}[错误] TLS 证书配置未完成${C_RESET}"
-    exit 1
-  fi
   ensure_warp_profile        || true
   if ! write_config; then
     echo -e "${C_RED}[错误] 生成配置失败${C_RESET}"
@@ -2749,7 +2963,8 @@ menu(){
     6) update_singbox; read -rp "回车返回..." _ || true; menu ;;
     7) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
     8) custom_route_menu; menu ;;
-    9) uninstall_all ;; # 直接退出
+    9) sbp_bootstrap; connection_settings_menu; menu ;;
+    10) uninstall_all ;; # 直接退出
     0|q|Q) exit 0 ;;
     *) echo -e "${C_YELLOW}无效选项，请重新选择${C_RESET}"; sleep 1; menu ;;
   esac
@@ -2769,4 +2984,6 @@ main(){
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
