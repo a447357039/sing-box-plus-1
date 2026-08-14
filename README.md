@@ -47,8 +47,6 @@ wget -O sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/si
 curl -fsSL -o sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh && bash sbp.sh
 ```
 
-> ⚠️ 本脚本为**交互式菜单**，不支持 `curl | bash` 管道方式运行。
-
 ---
 
 ## ♻️ 已有服务器轻量更新
@@ -164,7 +162,7 @@ Reality SNI 可独立修改。脚本会同时更新服务端握手目标和 VLES
 | 本机 WARP | `geosite:netflix` 走 WARP 解锁流媒体 |
 | 本机 IPv4 | `suffix:openai.com` 固定走 IPv4 出口 |
 | 本机 IPv6 | 需要原生 IPv6 的场景 |
-| 远程 VPS 节点 | 粘贴分享链接或 sing-box outbound JSON 导入 |
+| 远程 VPS 节点 | 粘贴分享链接（VLESS / Trojan / Hy2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）或 sing-box outbound JSON 导入 |
 
 匹配项支持逗号或空格分隔，支持以下格式：
 
@@ -289,7 +287,6 @@ DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sb
 
 - [sing-box](https://github.com/SagerNet/sing-box) — 核心代理引擎
 - [wgcf](https://github.com/ViRb3/wgcf) — WARP 账户注册工具
-- 原作者 Alvin9999
 
 ---
 

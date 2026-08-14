@@ -119,7 +119,50 @@ if ! echo "$status_out" | grep -q "20 节点端口监听监控"; then
   exit 1
 fi
 
-# 5. 测试 uninstall_all 交互取消与确认
+# 5. 测试 Socks5 / Socks5H / Socks / HTTP / HTTPS / TG 节点导入解析
+out_socks5=$(share_link_to_outbound "socks5://1.2.3.4:1080#my-socks" "ext-socks")
+assert_equal "socks" "$(printf '%s' "$out_socks5" | jq -r '.type')" "socks5 type"
+assert_equal "ext-socks" "$(printf '%s' "$out_socks5" | jq -r '.tag')" "socks5 tag"
+assert_equal "1.2.3.4" "$(printf '%s' "$out_socks5" | jq -r '.server')" "socks5 server"
+assert_equal "1080" "$(printf '%s' "$out_socks5" | jq -r '.server_port')" "socks5 port"
+assert_equal "5" "$(printf '%s' "$out_socks5" | jq -r '.version')" "socks5 version"
+
+out_socks5_auth=$(share_link_to_outbound "socks5://user%40test:p%40ss@198.51.100.1:1088#auth-socks" "ext-auth-socks")
+assert_equal "user@test" "$(printf '%s' "$out_socks5_auth" | jq -r '.username')" "socks5 username"
+assert_equal "p@ss" "$(printf '%s' "$out_socks5_auth" | jq -r '.password')" "socks5 password"
+
+out_socks5h=$(share_link_to_outbound "socks5h://alice:secret@proxy.example.com:1080" "ext-socks5h")
+assert_equal "proxy.example.com" "$(printf '%s' "$out_socks5h" | jq -r '.server')" "socks5h server"
+assert_equal "alice" "$(printf '%s' "$out_socks5h" | jq -r '.username')" "socks5h username"
+assert_equal "secret" "$(printf '%s' "$out_socks5h" | jq -r '.password')" "socks5h password"
+
+b64_ui=$(printf '%s' "foo:bar" | b64enc)
+out_socks_b64=$(share_link_to_outbound "socks://${b64_ui}@10.0.0.1:1080" "ext-socks-b64")
+assert_equal "foo" "$(printf '%s' "$out_socks_b64" | jq -r '.username')" "socks base64 username"
+assert_equal "bar" "$(printf '%s' "$out_socks_b64" | jq -r '.password')" "socks base64 password"
+
+out_http=$(share_link_to_outbound "http://admin:pass123@1.2.3.4:8080#http-node" "ext-http")
+assert_equal "http" "$(printf '%s' "$out_http" | jq -r '.type')" "http type"
+assert_equal "1.2.3.4" "$(printf '%s' "$out_http" | jq -r '.server')" "http server"
+assert_equal "8080" "$(printf '%s' "$out_http" | jq -r '.server_port')" "http port"
+assert_equal "admin" "$(printf '%s' "$out_http" | jq -r '.username')" "http username"
+assert_equal "pass123" "$(printf '%s' "$out_http" | jq -r '.password')" "http password"
+
+out_https=$(share_link_to_outbound "https://admin:pass123@proxy.example.com:8443?sni=secure.example.com&insecure=1" "ext-https")
+assert_equal "http" "$(printf '%s' "$out_https" | jq -r '.type')" "https type"
+assert_equal "true" "$(printf '%s' "$out_https" | jq -r '.tls.enabled')" "https tls enabled"
+assert_equal "secure.example.com" "$(printf '%s' "$out_https" | jq -r '.tls.server_name')" "https tls sni"
+assert_equal "true" "$(printf '%s' "$out_https" | jq -r '.tls.insecure')" "https tls insecure"
+
+out_tg_socks=$(share_link_to_outbound "tg://socks?server=198.51.100.2&port=1080&user=tguser&pass=tgpass" "tg-socks")
+assert_equal "socks" "$(printf '%s' "$out_tg_socks" | jq -r '.type')" "tg socks type"
+assert_equal "tguser" "$(printf '%s' "$out_tg_socks" | jq -r '.username')" "tg socks username"
+
+out_tg_http=$(share_link_to_outbound "tg://http-proxy?server=198.51.100.3&port=8080&user=tghttp&pass=tghttppass" "tg-http")
+assert_equal "http" "$(printf '%s' "$out_tg_http" | jq -r '.type')" "tg http type"
+assert_equal "tghttp" "$(printf '%s' "$out_tg_http" | jq -r '.username')" "tg http username"
+
+# 6. 测试 uninstall_all 交互取消与确认
 (echo "n" | uninstall_all) > "$test_root/uninstall_cancel.log" 2>&1 || true
 if [[ ! -d "$SB_DIR" ]]; then
   echo "FAIL: canceling uninstall must keep $SB_DIR intact" >&2
@@ -136,4 +179,4 @@ if [[ -f "$BIN_PATH" ]]; then
   exit 1
 fi
 
-printf '%s\n' "PASS: enhanced features (version compare, geofiles update, status viewer, uninstall) work correctly"
+printf '%s\n' "PASS: enhanced features (version compare, geofiles update, status viewer, socks/http import, uninstall) work correctly"

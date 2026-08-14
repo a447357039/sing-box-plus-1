@@ -931,6 +931,142 @@ share_link_to_outbound(){
         '{type:"anytls", tag:$tag, server:$server, server_port:$port, password:$password,
           tls:$tls, domain_resolver:"dns-doh-primary"}'
       ;;
+    socks|socks5|socks5h|socks4|socks4a)
+      local username="" password="" ver="5"
+      [[ "$scheme" == "socks4" || "$scheme" == "socks4a" ]] && ver="4"
+      local s_body="$body"
+      if [[ "$s_body" != *"@"* && "$s_body" != *:* ]]; then
+        local dec
+        dec="$(b64dec "$s_body" 2>/dev/null || true)"
+        [[ -n "$dec" ]] && s_body="${dec%/}"
+      fi
+
+      if [[ "$s_body" == *"@"* ]]; then
+        userinfo="${s_body%@*}"
+        hostport="${s_body##*@}"
+        local dec_ui
+        dec_ui="$(b64dec "$userinfo" 2>/dev/null || true)"
+        if [[ -n "$dec_ui" && "$dec_ui" == *:* ]]; then
+          userinfo="$dec_ui"
+        fi
+        if [[ "$userinfo" == *:* ]]; then
+          username="$(urldec "${userinfo%%:*}")"
+          password="$(urldec "${userinfo#*:}")"
+        else
+          username="$(urldec "$userinfo")"
+          password=""
+        fi
+      else
+        hostport="$s_body"
+      fi
+
+      split_hostport "$hostport" || return 1
+      server="$SBP_PARSED_HOST"; port="$SBP_PARSED_PORT"
+
+      local q_user q_pass q_ver
+      q_user="$(query_get "$query" user)"
+      [[ -z "$q_user" ]] && q_user="$(query_get "$query" username)"
+      q_pass="$(query_get "$query" pass)"
+      [[ -z "$q_pass" ]] && q_pass="$(query_get "$query" password)"
+      q_ver="$(query_get "$query" version)"
+      [[ -n "$q_user" ]] && username="$q_user"
+      [[ -n "$q_pass" ]] && password="$q_pass"
+      [[ -n "$q_ver" ]] && ver="$q_ver"
+
+      jq -n -c \
+        --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+        --arg user "$username" --arg pass "$password" --arg ver "$ver" '
+        {type:"socks", tag:$tag, server:$server, server_port:$port, version:$ver, domain_resolver:"dns-doh-primary"}
+        | if $user != "" then .username = $user else . end
+        | if $pass != "" then .password = $pass else . end'
+      ;;
+    http|https)
+      local username="" password="" is_https=false
+      [[ "$scheme" == "https" ]] && is_https=true
+      local h_body="$body"
+      if [[ "$h_body" != *"@"* && "$h_body" != *:* ]]; then
+        local dec
+        dec="$(b64dec "$h_body" 2>/dev/null || true)"
+        [[ -n "$dec" ]] && h_body="${dec%/}"
+      fi
+
+      if [[ "$h_body" == *"@"* ]]; then
+        userinfo="${h_body%@*}"
+        hostport="${h_body##*@}"
+        local dec_ui
+        dec_ui="$(b64dec "$userinfo" 2>/dev/null || true)"
+        if [[ -n "$dec_ui" && "$dec_ui" == *:* ]]; then
+          userinfo="$dec_ui"
+        fi
+        if [[ "$userinfo" == *:* ]]; then
+          username="$(urldec "${userinfo%%:*}")"
+          password="$(urldec "${userinfo#*:}")"
+        else
+          username="$(urldec "$userinfo")"
+          password=""
+        fi
+      else
+        hostport="$h_body"
+      fi
+
+      split_hostport "$hostport" || return 1
+      server="$SBP_PARSED_HOST"; port="$SBP_PARSED_PORT"
+
+      local q_user q_pass q_tls
+      q_user="$(query_get "$query" user)"
+      [[ -z "$q_user" ]] && q_user="$(query_get "$query" username)"
+      q_pass="$(query_get "$query" pass)"
+      [[ -z "$q_pass" ]] && q_pass="$(query_get "$query" password)"
+      q_tls="$(query_get "$query" tls)"
+      [[ -n "$q_user" ]] && username="$q_user"
+      [[ -n "$q_pass" ]] && password="$q_pass"
+      [[ "$q_tls" == "1" || "$q_tls" == "true" ]] && is_https=true
+
+      sni="$(query_get "$query" sni)"
+      [[ -z "$sni" ]] && sni="$(query_get "$query" host)"
+      [[ -z "$sni" && "$is_https" == true ]] && sni="$server"
+      insecure="$(query_get "$query" insecure)"
+      allow="$(query_get "$query" allowInsecure)"
+      [[ "$insecure" == "1" || "$allow" == "1" ]] && insecure=true || insecure=false
+
+      jq -n -c \
+        --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+        --arg user "$username" --arg pass "$password" \
+        --argjson is_https "$is_https" --arg sni "$sni" --argjson insecure "$insecure" '
+        {type:"http", tag:$tag, server:$server, server_port:$port, domain_resolver:"dns-doh-primary"}
+        | if $user != "" then .username = $user else . end
+        | if $pass != "" then .password = $pass else . end
+        | if $is_https then
+            .tls = ({enabled:true}
+                    | if $sni != "" then .server_name = $sni else . end
+                    | if $insecure then .insecure = true else . end)
+          else . end'
+      ;;
+    tg)
+      local tg_server tg_port tg_user tg_pass
+      tg_server="$(query_get "$query" server)"
+      tg_port="$(query_get "$query" port)"
+      tg_user="$(query_get "$query" user)"
+      tg_pass="$(query_get "$query" pass)"
+      [[ -z "$tg_server" || -z "$tg_port" ]] && return 1
+      [[ "$tg_port" =~ ^[0-9]+$ ]] || return 1
+
+      if [[ "$body" == "http-proxy" || "$body" == "http" ]]; then
+        jq -n -c \
+          --arg tag "$tag" --arg server "$tg_server" --argjson port "$tg_port" \
+          --arg user "$tg_user" --arg pass "$tg_pass" '
+          {type:"http", tag:$tag, server:$server, server_port:$port, domain_resolver:"dns-doh-primary"}
+          | if $user != "" then .username = $user else . end
+          | if $pass != "" then .password = $pass else . end'
+      else
+        jq -n -c \
+          --arg tag "$tag" --arg server "$tg_server" --argjson port "$tg_port" \
+          --arg user "$tg_user" --arg pass "$tg_pass" '
+          {type:"socks", tag:$tag, server:$server, server_port:$port, version:"5", domain_resolver:"dns-doh-primary"}
+          | if $user != "" then .username = $user else . end
+          | if $pass != "" then .password = $pass else . end'
+      fi
+      ;;
     *)
       return 1
       ;;
@@ -2407,7 +2543,7 @@ import_custom_route_outbound(){
     [[ "$yn" =~ ^[Yy]$ ]] || return 1
   fi
 
-  echo "粘贴分享链接、sing-box outbound JSON，或输入包含 sing-box 配置的文件路径。"
+  echo "粘贴分享链接（支持 VLESS / Trojan / Hysteria2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）、sing-box outbound JSON，或输入包含 sing-box 配置的文件路径。"
   read -r -p "节点配置: " raw || return 1
   [[ -f "$raw" ]] && raw="$(cat "$raw")"
 
@@ -2429,7 +2565,7 @@ import_custom_route_outbound(){
   fi
 
   if [[ -z "${outbound:-}" ]] || ! printf '%s' "$outbound" | jq -e 'type == "object" and (.type | type == "string") and (.tag | type == "string")' >/dev/null; then
-    warn "无法识别该节点配置。建议粘贴 sing-box outbound JSON，或使用本脚本输出的常见分享链接。"
+    warn "无法识别该节点配置。建议粘贴 sing-box outbound JSON，或使用标准分享链接（VLESS / Trojan / Hysteria2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）。"
     return 1
   fi
 
