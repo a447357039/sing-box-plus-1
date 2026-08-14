@@ -101,12 +101,8 @@ save_env
 print_links_grouped > "$test_root/self-signed-links.log"
 assert_equal 20 "$(wc -l < "$SHARE_LINKS_FILE" | tr -d ' ')" \
   "the persisted import file must contain all links"
-assert_equal 8 "$(grep -c 'insecure=0' "$SHARE_LINKS_FILE")" \
-  "all certificate-backed links must explicitly disable insecure mode"
-if grep -Eq '(^|[?&])(insecure|allowInsecure)=1([&#]|$)' "$SHARE_LINKS_FILE"; then
-  echo "FAIL: import links must never enable insecure mode" >&2
-  exit 1
-fi
+assert_equal 8 "$(grep -c 'insecure=1' "$SHARE_LINKS_FILE")" \
+  "all self-signed certificate-backed links must enable insecure mode (skip cert verification)"
 if grep -Fq 'allowInsecure' "$SHARE_LINKS_FILE"; then
   echo "FAIL: import links must not contain the deprecated allowInsecure parameter" >&2
   exit 1
@@ -135,8 +131,8 @@ if [[ "$old_cert_hash" == "$new_cert_hash" ]]; then
 fi
 openssl x509 -in "$TLS_CERT_PATH" -noout -checkhost edge.example.com >/dev/null
 print_links_grouped > "$test_root/updated-sni-links.log"
-assert_equal 8 "$(grep -c 'insecure=0&sni=edge.example.com' "$SHARE_LINKS_FILE")" \
-  "certificate-backed links must follow the updated self-signed SNI"
+assert_equal 8 "$(grep -c 'insecure=1&sni=edge.example.com' "$SHARE_LINKS_FILE")" \
+  "certificate-backed links must follow the updated self-signed SNI and allow insecure"
 assert_equal 6 "$(grep -c 'security=reality&sni=edge.example.com' "$SHARE_LINKS_FILE")" \
   "Reality links must follow the updated SNI"
 
@@ -154,6 +150,8 @@ assert_equal 8 "$(grep -c '@vpn.example.com:' "$SHARE_LINKS_FILE")" \
   "certificate-backed links must follow the configured certificate domain"
 assert_equal 8 "$(grep -c 'sni=vpn.example.com' "$SHARE_LINKS_FILE")" \
   "certificate-backed links must use the certificate domain as SNI"
+assert_equal 8 "$(grep -c 'insecure=0&sni=vpn.example.com' "$SHARE_LINKS_FILE")" \
+  "public certificate-backed links must enforce certificate verification (insecure=0)"
 if grep -Eq '(^|[?&])(insecure|allowInsecure)=1([&#]|$)' "$SHARE_LINKS_FILE"; then
   echo "FAIL: invalid public certificate state must not downgrade link security" >&2
   exit 1

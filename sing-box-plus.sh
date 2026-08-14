@@ -2170,14 +2170,14 @@ print_links_grouped(){
     tls_host="$TLS_DOMAIN"
     tls_security_query="insecure=0&sni=$(urlenc "$TLS_DOMAIN")"
     if tls_uses_public_certificate; then
-      tls_tip="Hysteria2 / TUIC / AnyTLS 已使用公开有效证书并强制校验证书"
+      tls_tip="Hysteria2 / TUIC / AnyTLS 已使用公开有效证书并校验证书"
     else
       tls_tip="证书当前无法通过公开 CA 校验；导入链接仍保持安全校验，修复证书前连接会失败"
     fi
   else
     tls_host="$ip"
-    tls_security_query="insecure=0&sni=$(urlenc "$REALITY_SERVER")"
-    tls_tip="Hysteria2 / TUIC / AnyTLS 使用自签证书且强制校验；客户端需先信任该证书"
+    tls_security_query="insecure=1&sni=$(urlenc "$REALITY_SERVER")"
+    tls_tip="Hysteria2 / TUIC / AnyTLS 使用自签证书并已允许跳过证书验证"
   fi
   # 直连10
   links_direct+=("vless://${UUID}@${ip}:${PORT_VLESSR}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality")

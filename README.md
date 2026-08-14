@@ -117,8 +117,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 ### 1. 自签证书（默认）
 
 - 无需域名，可直接生成
-- 导入链接明确写入 `insecure=0`，不再输出旧的 `allowInsecure` 参数
-- 客户端必须先信任该自签证书，否则安全校验会拒绝连接
+- AnyTLS、Hysteria2、TUIC v5 导入链接自动包含 `insecure=1`（允许不安全连接 / 跳过证书验证），无需在客户端进行繁琐的证书信任操作即可即开即用
 
 ### 2. 手动上传证书
 
@@ -257,8 +256,8 @@ DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sb
 <details>
 <summary><b>Hysteria2 / TUIC / AnyTLS 报域名不匹配错误？</b></summary>
 
-确认证书模式和 SNI 一致：
-- **自签证书**：导入链接保持严格校验，需先在客户端信任该证书
+确认证书模式和 SNI 设置：
+- **自签证书**：导入链接默认允许跳过证书校验（`insecure=1`），可直接连接使用
 - **手动证书 / ACME**：确保域名 A 记录指向服务器 IP，脚本会自动将 SNI 设为与证书域名一致
 
 如已部署但仍报错，运行脚本并进入 `6) 域名、证书与 SNI 设置` 修正设置；成功后服务配置和导入链接会自动更新。
