@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v2.9.0
+#  Version: v3.0.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -229,7 +229,7 @@ sbp_mark_deps_ok() {
 
 # 入口：装依赖 / 二进制回退
 sbp_bootstrap() {
-  [ "$EUID" -eq 0 ] || { echo "请以 root 运行（或 sudo）"; exit 1; }
+  [ "$EUID" -eq 0 ] || [ "${SBP_SKIP_ROOT:-0}" = 1 ] || [ -n "${TEST_ROOT:-}" ] || { echo "请以 root 运行（或 sudo）"; exit 1; }
 
   if [ "$SBP_SKIP_DEPS" = 1 ]; then
     echo "[INFO] 已跳过启动时依赖检查（SBP_SKIP_DEPS=1）"
@@ -328,7 +328,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v2.9.0"
+SCRIPT_VERSION="v3.0.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -1289,56 +1289,194 @@ ensure_warp_profile(){
   save_warp
 }
 
-# ===== 依赖与安装 =====
-install_deps(){
-  apt-get update -y >/dev/null 2>&1 || true
-  apt-get install -y ca-certificates curl wget jq tar iproute2 openssl coreutils uuid-runtime >/dev/null 2>&1 || true
+# ===== 版本探测与比对 =====
+get_singbox_local_version() {
+  local bin="${1:-$BIN_PATH}"
+  if [[ -x "$bin" ]] || command -v "$bin" >/dev/null 2>&1; then
+    local v_str
+    v_str="$("$bin" version 2>/dev/null | head -n1)" || return 1
+    if [[ "$v_str" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9.]+)*) ]]; then
+      echo "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  fi
+  return 1
 }
 
-# ===== 安装 / 更新 sing-box（GitHub Releases）=====
-install_singbox() {
+get_singbox_remote_version() {
+  local tag="${SINGBOX_TAG:-latest}"
+  local repo="SagerNet/sing-box"
+  local ver=""
 
-  # 已安装则直接返回
-  if command -v "$BIN_PATH" >/dev/null 2>&1; then
-    info "检测到 sing-box: $("$BIN_PATH" version | head -n1)"
+  if [[ "$tag" != "latest" ]]; then
+    echo "${tag#v}"
     return 0
   fi
 
-  # 依赖
+  # 1. 优先通过 GitHub Releases API 获取
+  local json
+  json="$(curl -fsSL --connect-timeout 5 -m 10 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null || true)"
+  if [[ -n "$json" ]] && command -v jq >/dev/null 2>&1; then
+    ver="$(printf '%s' "$json" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+  fi
+
+  # 2. API 限流或无 jq 时通过 HTTP Redirect Header 探测
+  if [[ -z "$ver" || "$ver" == "null" ]]; then
+    local loc
+    loc="$(curl -fsSI --connect-timeout 5 -m 10 "https://github.com/${repo}/releases/latest" 2>/dev/null | grep -i '^location:' | tr -d '\r\n' || true)"
+    if [[ "$loc" =~ /tag/v?([0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9.]+)*) ]]; then
+      ver="${BASH_REMATCH[1]}"
+    fi
+  fi
+
+  ver="${ver#v}"
+  if [[ -n "$ver" && "$ver" != "null" ]]; then
+    echo "$ver"
+    return 0
+  fi
+  return 1
+}
+
+version_lt() {
+  local v1="$1" v2="$2"
+  [[ "$v1" == "$v2" ]] && return 1
+
+  # 分离主版本号与预发布后缀 (例如 1.12.0-rc.1 -> core="1.12.0", pre="rc.1")
+  local core1="${v1%%-*}" pre1=""
+  [[ "$v1" == *-* ]] && pre1="${v1#*-}"
+
+  local core2="${v2%%-*}" pre2=""
+  [[ "$v2" == *-* ]] && pre2="${v2#*-}"
+
+  local IFS=.
+  local -a i1=($core1) i2=($core2)
+  local max=${#i1[@]}
+  (( ${#i2[@]} > max )) && max=${#i2[@]}
+
+  for ((i=0; i<max; i++)); do
+    local n1=${i1[i]:-0} n2=${i2[i]:-0}
+    [[ "$n1" =~ ^[0-9]+$ ]] || n1=0
+    [[ "$n2" =~ ^[0-9]+$ ]] || n2=0
+    if (( n1 < n2 )); then
+      return 0
+    elif (( n1 > n2 )); then
+      return 1
+    fi
+  done
+
+  # 核心版本相同时：有预发布后缀的版本 < 无预发布后缀的正式版
+  if [[ -n "$pre1" && -z "$pre2" ]]; then
+    return 0
+  elif [[ -z "$pre1" && -n "$pre2" ]]; then
+    return 1
+  elif [[ -n "$pre1" && -n "$pre2" ]]; then
+    [[ "$pre1" < "$pre2" ]] && return 0 || return 1
+  fi
+
+  return 1
+}
+
+# ===== 依赖与安装 =====
+install_deps(){
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y ca-certificates curl wget jq tar iproute2 openssl coreutils uuid-runtime >/dev/null 2>&1 || true
+  else
+    ensure_deps curl jq tar openssl || true
+  fi
+}
+
+# ===== 安装 / 智能升级 sing-box =====
+install_singbox() {
+  local force="${1:-0}"
+  local local_ver="" remote_ver="" needs_install=1
+
+  # 基础依赖
   ensure_deps curl jq tar || return 1
   command -v xz >/dev/null 2>&1 || ensure_deps xz-utils >/dev/null 2>&1 || true
-  command -v unzip >/dev/null 2>&1 || ensure_deps unzip   >/dev/null 2>&1 || true
+  command -v unzip >/dev/null 2>&1 || ensure_deps unzip >/dev/null 2>&1 || true
+
+  remote_ver="$(get_singbox_remote_version 2>/dev/null || true)"
+
+  if local_ver="$(get_singbox_local_version "$BIN_PATH")"; then
+    info "检测到已安装 sing-box: v${local_ver}"
+    if [[ -n "$remote_ver" ]]; then
+      if version_lt "$local_ver" "$remote_ver"; then
+        info "发现新版本 sing-box: v${remote_ver}（当前版本: v${local_ver}），准备自动升级..."
+        needs_install=1
+      else
+        if [[ "$force" -eq 1 ]]; then
+          info "当前已是最新版本 (v${local_ver})，按指令重新下载安装..."
+          needs_install=1
+        else
+          info "sing-box 当前已是最新版本 (v${local_ver})，无需重复下载"
+          needs_install=0
+        fi
+      fi
+    else
+      if [[ "$force" -eq 1 ]]; then
+        info "未能获取远端最新版本，强制重新安装..."
+        needs_install=1
+      else
+        info "未能获取远端版本信息，保留现有已安装版本 (v${local_ver})"
+        needs_install=0
+      fi
+    fi
+  else
+    info "未检测到已安装的 sing-box，准备开始全新安装..."
+    needs_install=1
+  fi
+
+  if [[ "$needs_install" -eq 0 ]]; then
+    return 0
+  fi
 
   local repo="SagerNet/sing-box"
-  local tag="${SINGBOX_TAG:-latest}"   # 允许用环境变量固定版本，如 v1.12.7
+  local tag="${SINGBOX_TAG:-latest}"
   local arch; arch="$(arch_map)"
-  local api url tmp pkg re rel_url
+  local rel_url re url tmp pkg bin
 
   info "下载 sing-box (${arch}) ..."
-
-  # 取 release JSON
-  if [[ "$tag" = "latest" ]]; then
+  if [[ "$tag" == "latest" ]]; then
     rel_url="https://api.github.com/repos/${repo}/releases/latest"
   else
     rel_url="https://api.github.com/repos/${repo}/releases/tags/${tag}"
   fi
 
-  # 资产名匹配：兼容 tar.gz / tar.xz / zip
-  # 典型名称：sing-box-1.12.7-linux-amd64.tar.gz
   re="^sing-box-.*-linux-${arch}\\.(tar\\.(gz|xz)|zip)$"
-
-  # 先在目标 release 里找；找不到再从所有 releases 里兜底
-  url="$(curl -fsSL "$rel_url" | jq -r --arg re "$re" '.assets[] | select(.name | test($re)) | .browser_download_url' | head -n1)"
-  if [[ -z "$url" ]]; then
-    url="$(curl -fsSL "https://api.github.com/repos/${repo}/releases" \
-           | jq -r --arg re "$re" '[ .[] | .assets[] | select(.name | test($re)) | .browser_download_url ][0]')"
+  url="$(curl -fsSL --connect-timeout 5 -m 15 "$rel_url" 2>/dev/null | jq -r --arg re "$re" '.assets[] | select(.name | test($re)) | .browser_download_url' 2>/dev/null | head -n1 || true)"
+  if [[ -z "$url" || "$url" == "null" ]]; then
+    url="$(curl -fsSL --connect-timeout 5 -m 15 "https://api.github.com/repos/${repo}/releases" 2>/dev/null \
+           | jq -r --arg re "$re" '[ .[] | .assets[] | select(.name | test($re)) | .browser_download_url ][0]' 2>/dev/null || true)"
   fi
-  [[ -n "$url" ]] || { die "下载 sing-box 失败：未匹配到发行包（arch=${arch} tag=${tag})"; return 1; }
+  if [[ -z "$url" || "$url" == "null" ]]; then
+    if [[ -n "$remote_ver" ]]; then
+      url="https://github.com/${repo}/releases/download/v${remote_ver}/sing-box-${remote_ver}-linux-${arch}.tar.gz"
+    else
+      die "下载 sing-box 失败：未匹配到发行包（arch=${arch} tag=${tag})"
+      return 1
+    fi
+  fi
 
+  tmp="$(mktemp -d)" || return 1
+  pkg="${tmp}/pkg"
 
-  tmp="$(mktemp -d)"; pkg="${tmp}/pkg"
-  if ! curl -fL "$url" -o "$pkg"; then
-    rm -rf "$tmp"; die "下载 sing-box 失败"; return 1
+  # 多节点/镜像加速下载
+  local dl_ok=0
+  local urls_to_try=("$url")
+  [[ "$url" == https://github.com/* ]] && urls_to_try+=("https://ghproxy.net/$url" "https://raw.gitmirror.com/$url")
+
+  for try_url in "${urls_to_try[@]}"; do
+    if curl -fL --connect-timeout 10 -m 60 "$try_url" -o "$pkg" 2>/dev/null; then
+      dl_ok=1
+      break
+    fi
+  done
+
+  if [[ "$dl_ok" -ne 1 ]]; then
+    rm -rf "$tmp"
+    die "下载 sing-box 失败：$url"
+    return 1
   fi
 
   # 解压
@@ -1349,17 +1487,162 @@ install_singbox() {
   elif echo "$url" | grep -qE '\.zip$'; then
     unzip -q "$pkg" -d "$tmp"
   else
-    rm -rf "$tmp"; die "未知包格式：$url"; return 1
+    rm -rf "$tmp"
+    die "未知包格式：$url"
+    return 1
   fi
 
-  # 找到二进制并安装
-  local bin
   bin="$(find "$tmp" -type f -name 'sing-box' | head -n1)"
-  [[ -n "$bin" ]] || { rm -rf "$tmp"; die "解压失败：未找到 sing-box 可执行文件"; return 1; }
+  if [[ -z "$bin" || ! -f "$bin" ]]; then
+    rm -rf "$tmp"
+    die "解压失败：未在安装包中找到 sing-box 可执行文件"
+    return 1
+  fi
 
-  install -m 0755 "$bin" "$BIN_PATH"
-  rm -rf "$tmp"
-  info "安装完成：$("$BIN_PATH" version | head -n1)"
+  chmod 0755 "$bin"
+  if ! "$bin" version >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    die "下载的 sing-box 无法正常执行，请检查系统架构兼容性"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$BIN_PATH")" "$SBP_BIN_DIR" 2>/dev/null || true
+  if [[ -f "$BIN_PATH" ]]; then
+    cp -f "$BIN_PATH" "${BIN_PATH}.bak" 2>/dev/null || true
+  fi
+
+  if install -m 0755 "$bin" "$BIN_PATH"; then
+    ln -sf "$BIN_PATH" "$SBP_BIN_DIR/sing-box" 2>/dev/null || true
+    rm -f "${BIN_PATH}.bak" 2>/dev/null || true
+    rm -rf "$tmp"
+    local new_installed_ver
+    new_installed_ver="$(get_singbox_local_version "$BIN_PATH" || echo "最新")"
+    info "sing-box 安装/升级完成：v${new_installed_ver}"
+    return 0
+  else
+    [[ -f "${BIN_PATH}.bak" ]] && mv -f "${BIN_PATH}.bak" "$BIN_PATH" 2>/dev/null || true
+    rm -rf "$tmp"
+    die "写入 sing-box 二进制到 $BIN_PATH 失败"
+    return 1
+  fi
+}
+
+# ===== GeoFiles 规则文件更新模块 =====
+update_geofiles() {
+  ensure_dirs
+  ensure_deps curl jq || return 1
+
+  info "正在准备更新 GeoFiles (GeoIP / GeoSite / 规则集)..."
+
+  local tmp_geo
+  tmp_geo="$(mktemp -d)" || return 1
+
+  fetch_geofile() {
+    local filename="$1"
+    shift
+    local target="$tmp_geo/$filename"
+    local success=0
+
+    for u in "$@"; do
+      echo -ne "  [下载] $filename <- $u ... "
+      if curl -fsSL --connect-timeout 10 -m 60 -o "$target" "$u" 2>/dev/null && [[ -s "$target" ]]; then
+        local sz
+        sz="$(wc -c < "$target" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
+        echo -e "${C_GREEN}成功 (${sz})${C_RESET}"
+        success=1
+        break
+      else
+        echo -e "${C_YELLOW}失败，尝试备用节点${C_RESET}"
+      fi
+    done
+
+    if [[ "$success" -eq 1 ]]; then
+      return 0
+    else
+      warn "未能下载 $filename，将跳过该文件"
+      return 1
+    fi
+  }
+
+  echo -e "${C_CYAN}--- 开始下载最新 GeoIP / GeoSite 规则文件 ---${C_RESET}"
+
+  # 1. geoip.db
+  fetch_geofile "geoip.db" \
+    "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db" \
+    "https://ghproxy.net/https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db" \
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.db" \
+    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.db" || true
+
+  # 2. geosite.db
+  fetch_geofile "geosite.db" \
+    "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db" \
+    "https://ghproxy.net/https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db" \
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.db" \
+    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.db" || true
+
+  # 3. 常用 SRS 规则集
+  fetch_geofile "geoip-cn.srs" \
+    "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" \
+    "https://ghproxy.net/https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" \
+    "https://raw.gitmirror.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" || true
+
+  fetch_geofile "geosite-cn.srs" \
+    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" \
+    "https://ghproxy.net/https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" \
+    "https://raw.gitmirror.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" || true
+
+  fetch_geofile "geosite-geolocation-!cn.srs" \
+    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs" \
+    "https://ghproxy.net/https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs" \
+    "https://raw.gitmirror.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs" || true
+
+  # 4. 自定义路由中定义的 remote rule-sets
+  if [[ -s "$ROUTE_JSON" ]] && command -v jq >/dev/null 2>&1; then
+    local custom_tags=() custom_urls=()
+    while IFS=$'\t' read -r tag url; do
+      [[ -n "$tag" && -n "$url" ]] || continue
+      custom_tags+=("$tag")
+      custom_urls+=("$url")
+    done < <(jq -r '(.rule_set // [])[] | select(.type=="remote" and .tag != null and .url != null) | [.tag, .url] | @tsv' "$ROUTE_JSON" 2>/dev/null || true)
+
+    for ((i=0; i<${#custom_tags[@]}; i++)); do
+      local tag="${custom_tags[i]}"
+      local url="${custom_urls[i]}"
+      fetch_geofile "${tag}.srs" "$url" "https://ghproxy.net/$url" "https://raw.gitmirror.com/${url#*raw.githubusercontent.com/}" || true
+    done
+  fi
+
+  local target_dirs=("$DATA_DIR" "$SB_DIR")
+  [[ -d "/var/lib/sing-box" ]] && target_dirs+=("/var/lib/sing-box")
+
+  local installed_files=0
+  for f in "$tmp_geo"/*; do
+    [[ -f "$f" ]] || continue
+    local fname; fname="$(basename "$f")"
+    for tdir in "${target_dirs[@]}"; do
+      mkdir -p "$tdir" 2>/dev/null || true
+      cp -f "$f" "$tdir/$fname" 2>/dev/null || true
+    done
+    ((installed_files++)) || true
+  done
+
+  rm -rf "$tmp_geo"
+
+  if [[ "$installed_files" -gt 0 ]]; then
+    local update_time
+    update_time="$(date '+%Y-%m-%d %H:%M:%S %z')"
+    printf 'LAST_UPDATE="%s"\nFILES_COUNT=%d\n' "$update_time" "$installed_files" > "$SB_DIR/geofiles.version"
+    info "GeoFiles 规则文件更新完成！共更新 ${installed_files} 个规则文件 (时间: ${update_time})"
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
+      info "正在重启 sing-box 服务以应用最新规则..."
+      systemctl restart "${SYSTEMD_SERVICE}" || warn "重启服务失败，请稍后手动重启"
+    fi
+    return 0
+  else
+    warn "GeoFiles 更新失败：所有规则文件均未成功下载，请检查网络连接"
+    return 1
+  fi
 }
 
 # ===== 运行时辅助：DNS 健康切换与服务事件记录 =====
@@ -2467,12 +2750,203 @@ enable_bbr(){
   fi
 }
 
-# ===== 显示状态与 banner =====
+# ===== 显示状态与看板 =====
 sb_service_state(){
-  systemctl is-active --quiet "${SYSTEMD_SERVICE:-sing-box.service}" && echo -e "${C_GREEN}运行中${C_RESET}" || echo -e "${C_RED}未运行/未安装${C_RESET}"
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet "${SYSTEMD_SERVICE:-sing-box.service}"; then
+      echo -e "${C_GREEN}运行中 (Active)${C_RESET}"
+    else
+      echo -e "${C_RED}未运行 (Inactive)${C_RESET}"
+    fi
+  else
+    echo -e "${C_YELLOW}未检测到 systemd${C_RESET}"
+  fi
 }
+
 bbr_state(){
   sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && echo -e "${C_GREEN}已启用 BBR${C_RESET}" || echo -e "${C_RED}未启用 BBR${C_RESET}"
+}
+
+show_service_status(){
+  load_env || true
+  load_creds || true
+  load_ports || true
+
+  clear >/dev/null 2>&1 || true
+  hr
+  echo -e " ${C_CYAN}${C_BOLD}📊 Sing-Box-Plus 综合运行状态看板 📊${C_RESET}"
+  echo -e " ${C_DIM}检测时间: $(date '+%Y-%m-%d %H:%M:%S %z')${C_RESET}"
+  hr
+
+  # 1. 服务核心状态
+  echo -e "${C_BOLD}【1. sing-box 服务状态】${C_RESET}"
+  local svc_active="inactive" svc_pid="-" svc_mem="-" svc_uptime="-" restarts="0"
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
+      svc_active="active"
+      svc_pid="$(systemctl show "$SYSTEMD_SERVICE" --property MainPID --value 2>/dev/null || echo "-")"
+      restarts="$(systemctl show "$SYSTEMD_SERVICE" --property NRestarts --value 2>/dev/null || echo "0")"
+      local enter_ts
+      enter_ts="$(systemctl show "$SYSTEMD_SERVICE" --property ActiveEnterTimestamp --value 2>/dev/null || true)"
+      [[ -n "$enter_ts" ]] && svc_uptime="$enter_ts" || svc_uptime="运行中"
+      if [[ "$svc_pid" =~ ^[0-9]+$ && "$svc_pid" -gt 0 && -f "/proc/$svc_pid/status" ]]; then
+        local rss_kb
+        rss_kb="$(awk '/VmRSS/{print $2}' "/proc/$svc_pid/status" 2>/dev/null || true)"
+        if [[ -n "$rss_kb" && "$rss_kb" =~ ^[0-9]+$ ]]; then
+          svc_mem="$(awk "BEGIN {printf \"%.2f MB\", $rss_kb/1024}")"
+        fi
+      fi
+    fi
+  fi
+
+  if [[ "$svc_active" == "active" ]]; then
+    echo -e "  服务状态:    ${C_GREEN}● 运行中 (Active)${C_RESET}"
+    echo -e "  主进程PID:   ${svc_pid}  |  内存占用: ${svc_mem}  |  异常重启: ${restarts} 次"
+    echo -e "  启动时间:    ${svc_uptime}"
+  else
+    echo -e "  服务状态:    ${C_RED}● 未运行 / 已停止 (Inactive)${C_RESET}"
+  fi
+
+  # 2. 版本与规则信息
+  echo
+  echo -e "${C_BOLD}【2. 核心版本与规则】${C_RESET}"
+  local cur_ver rem_ver
+  cur_ver="$(get_singbox_local_version "$BIN_PATH" 2>/dev/null || echo "未安装")"
+  rem_ver="$(get_singbox_remote_version 2>/dev/null || echo "检测中...")"
+  if [[ "$cur_ver" != "未安装" ]]; then
+    if [[ "$rem_ver" != "检测中..." && "$rem_ver" != "$cur_ver" && -n "$rem_ver" ]]; then
+      echo -e "  sing-box 核心: v${cur_ver} ${C_YELLOW}(可升级至最新 v${rem_ver})${C_RESET}"
+    else
+      echo -e "  sing-box 核心: v${cur_ver} ${C_GREEN}(最新版)${C_RESET}"
+    fi
+  else
+    echo -e "  sing-box 核心: ${C_RED}未安装${C_RESET}"
+  fi
+
+  local geo_ver="未记录" geo_geoip="未找到" geo_geosite="未找到"
+  [[ -f "$SB_DIR/geofiles.version" ]] && geo_ver="$(awk -F'=' '/LAST_UPDATE/{gsub(/"/,""); print $2}' "$SB_DIR/geofiles.version" 2>/dev/null || echo "已记录")"
+  if [[ -f "$DATA_DIR/geoip.db" ]]; then
+    geo_geoip="$(wc -c < "$DATA_DIR/geoip.db" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
+  elif [[ -f "$SB_DIR/geoip.db" ]]; then
+    geo_geoip="$(wc -c < "$SB_DIR/geoip.db" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
+  fi
+  if [[ -f "$DATA_DIR/geosite.db" ]]; then
+    geo_geosite="$(wc -c < "$DATA_DIR/geosite.db" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
+  elif [[ -f "$SB_DIR/geosite.db" ]]; then
+    geo_geosite="$(wc -c < "$SB_DIR/geosite.db" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
+  fi
+  echo -e "  GeoFiles 规则: 上次更新 [${geo_ver}] | geoip.db (${geo_geoip}) | geosite.db (${geo_geosite})"
+
+  # 3. 20 节点监听状态探测
+  echo
+  echo -e "${C_BOLD}【3. 20 节点端口监听监控】${C_RESET}"
+  local listening_ports=""
+  if command -v ss >/dev/null 2>&1; then
+    listening_ports="$(ss -tulpn 2>/dev/null || true)"
+  elif command -v netstat >/dev/null 2>&1; then
+    listening_ports="$(netstat -tulpn 2>/dev/null || true)"
+  fi
+
+  check_port_status() {
+    local port="$1" proto="$2"
+    [[ -n "$port" ]] || { echo -e "${C_DIM}未分配${C_RESET}"; return; }
+    if [[ -z "$listening_ports" ]]; then
+      echo -e "${C_CYAN}${port}/${proto}${C_RESET}"
+      return
+    fi
+    if echo "$listening_ports" | grep -qE ":${port}\b"; then
+      echo -e "${C_GREEN}${port}/${proto} ● 监听正常${C_RESET}"
+    else
+      echo -e "${C_RED}${port}/${proto} ○ 未监听${C_RESET}"
+    fi
+  }
+
+  echo -e "  ${C_CYAN}[直连 10 节点]${C_RESET}"
+  printf "    %-18s : %b\n" "1. VLESS-Reality" "$(check_port_status "${PORT_VLESSR:-}" "tcp")"
+  printf "    %-18s : %b\n" "2. VLESS-gRPC-Real" "$(check_port_status "${PORT_VLESS_GRPCR:-}" "tcp")"
+  printf "    %-18s : %b\n" "3. Trojan-Reality" "$(check_port_status "${PORT_TROJANR:-}" "tcp")"
+  printf "    %-18s : %b\n" "4. Hysteria2" "$(check_port_status "${PORT_HY2:-}" "udp")"
+  printf "    %-18s : %b\n" "5. VMess-WS" "$(check_port_status "${PORT_VMESS_WS:-}" "tcp")"
+  printf "    %-18s : %b\n" "6. Hysteria2-Obfs" "$(check_port_status "${PORT_HY2_OBFS:-}" "udp")"
+  printf "    %-18s : %b\n" "7. SS-2022" "$(check_port_status "${PORT_SS2022:-}" "tcp/udp")"
+  printf "    %-18s : %b\n" "8. Shadowsocks" "$(check_port_status "${PORT_SS:-}" "tcp/udp")"
+  printf "    %-18s : %b\n" "9. TUIC v5" "$(check_port_status "${PORT_TUIC:-}" "udp")"
+  printf "    %-18s : %b\n" "10. AnyTLS" "$(check_port_status "${PORT_ANYTLS:-}" "tcp")"
+
+  echo -e "  ${C_CYAN}[WARP 10 节点]${C_RESET}"
+  printf "    %-18s : %b\n" "11. VLESS-Reality-W" "$(check_port_status "${PORT_VLESSR_W:-}" "tcp")"
+  printf "    %-18s : %b\n" "12. VLESS-gRPC-W" "$(check_port_status "${PORT_VLESS_GRPCR_W:-}" "tcp")"
+  printf "    %-18s : %b\n" "13. Trojan-Real-W" "$(check_port_status "${PORT_TROJANR_W:-}" "tcp")"
+  printf "    %-18s : %b\n" "14. Hysteria2-W" "$(check_port_status "${PORT_HY2_W:-}" "udp")"
+  printf "    %-18s : %b\n" "15. VMess-WS-W" "$(check_port_status "${PORT_VMESS_WS_W:-}" "tcp")"
+  printf "    %-18s : %b\n" "16. Hy2-Obfs-W" "$(check_port_status "${PORT_HY2_OBFS_W:-}" "udp")"
+  printf "    %-18s : %b\n" "17. SS-2022-W" "$(check_port_status "${PORT_SS2022_W:-}" "tcp/udp")"
+  printf "    %-18s : %b\n" "18. Shadowsocks-W" "$(check_port_status "${PORT_SS_W:-}" "tcp/udp")"
+  printf "    %-18s : %b\n" "19. TUIC-v5-W" "$(check_port_status "${PORT_TUIC_W:-}" "udp")"
+  printf "    %-18s : %b\n" "20. AnyTLS-W" "$(check_port_status "${PORT_ANYTLS_W:-}" "tcp")"
+
+  # 4. DNS 与健康检查
+  echo
+  echo -e "${C_BOLD}【4. DNS 与健康检查】${C_RESET}"
+  local cur_dns="未知" timer_state="未启用"
+  if [[ -s "$CONF_JSON" ]] && command -v jq >/dev/null 2>&1; then
+    cur_dns="$(jq -r '.dns.final // "未配置"' "$CONF_JSON" 2>/dev/null || echo "未知")"
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet "$DNS_HEALTH_TIMER" 2>/dev/null; then
+      timer_state="${C_GREEN}运行中 (周期: ${DNS_HEALTH_INTERVAL})${C_RESET}"
+    else
+      timer_state="${C_YELLOW}未激活${C_RESET}"
+    fi
+  fi
+  echo -e "  当前主 DNS:    ${cur_dns}"
+  echo -e "  健康定时器:    ${timer_state}"
+  if [[ -s "$DNS_HEALTH_LOG" ]]; then
+    local last_dns_event
+    last_dns_event="$(tail -n1 "$DNS_HEALTH_LOG" 2>/dev/null || true)"
+    echo -e "  最新切换记录:  ${C_DIM}${last_dns_event}${C_RESET}"
+  fi
+
+  # 5. TLS 证书与 SNI
+  echo
+  echo -e "${C_BOLD}【5. TLS 证书与 SNI】${C_RESET}"
+  echo -e "  证书模式:      $(tls_mode_label)"
+  echo -e "  Reality SNI:   ${REALITY_SERVER:-未配置}"
+  if [[ -n "${TLS_DOMAIN:-}" ]]; then
+    echo -e "  证书域名:      ${TLS_DOMAIN}"
+  fi
+  if [[ -f "$TLS_CERT_PATH" ]] && command -v openssl >/dev/null 2>&1; then
+    local end_date exp_days
+    end_date="$(openssl x509 -enddate -noout -in "$TLS_CERT_PATH" 2>/dev/null | cut -d= -f2- || echo "未知")"
+    local end_epoch now_epoch
+    end_epoch="$(date -d "$end_date" +%s 2>/dev/null || echo 0)"
+    now_epoch="$(date +%s)"
+    if (( end_epoch > now_epoch )); then
+      exp_days=$(( (end_epoch - now_epoch) / 86400 ))
+      echo -e "  证书到期时间:  ${end_date} ${C_GREEN}(剩余 ${exp_days} 天)${C_RESET}"
+    else
+      echo -e "  证书到期时间:  ${end_date} ${C_RED}(已过期)${C_RESET}"
+    fi
+  fi
+
+  # 6. 系统加速与网络
+  echo
+  echo -e "${C_BOLD}【6. 系统网络与加速】${C_RESET}"
+  echo -e "  BBR 加速状态:  $(bbr_state)"
+  local cc ct_cur ct_max
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")"
+  ct_cur="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "0")"
+  ct_max="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "0")"
+  echo -e "  TCP 拥塞算法:  ${cc}  |  连接跟踪: ${ct_cur}/${ct_max}"
+
+  # 7. 最近服务日志
+  if command -v journalctl >/dev/null 2>&1; then
+    echo
+    echo -e "${C_BOLD}【7. 最近运行日志 (最新 8 条)】${C_RESET}"
+    journalctl -u "$SYSTEMD_SERVICE" -n 8 --no-pager 2>/dev/null | sed 's/^/  /' || echo "  暂无日志"
+  fi
+
+  hr
 }
 
 banner(){
@@ -2480,22 +2954,41 @@ banner(){
   hr
   echo -e " ${C_CYAN}🚀 ${SCRIPT_NAME} ${SCRIPT_VERSION} 🚀${C_RESET}"
   echo -e "${C_CYAN} 脚本更新地址: https://github.com/yayitinyu/sing-box-plus${C_RESET}"
+  hr
 
+  local quick_svc quick_ver quick_bbr quick_tls
+  quick_svc="$(sb_service_state)"
+  quick_bbr="$(bbr_state)"
+  local cur_v; cur_v="$(get_singbox_local_version "$BIN_PATH" 2>/dev/null || echo "")"
+  if [[ -n "$cur_v" ]]; then
+    quick_ver="sing-box v${cur_v}"
+  else
+    quick_ver="未安装"
+  fi
+  quick_tls="$(tls_mode_label)"
+
+  echo -e "  服务状态: ${quick_svc}  |  核心版本: ${quick_ver}"
+  echo -e "  系统加速: ${quick_bbr}  |  证书模式: ${quick_tls}"
   hr
-  echo -e "系统加速状态：$(bbr_state)"
-  echo -e "Sing-Box 启动状态：$(sb_service_state)"
-  hr
-  echo -e "  ${C_BLUE}1)${C_RESET} 安装/部署（20 节点）"
-  echo -e "  ${C_GREEN}2)${C_RESET} 查看分享链接"
-  echo -e "  ${C_GREEN}3)${C_RESET} 重启服务"
-  echo -e "  ${C_GREEN}4)${C_RESET} 一键更换所有端口"
-  echo -e "  ${C_GREEN}5)${C_RESET} 一键开启 BBR"
-  echo -e "  ${C_YELLOW}6)${C_RESET} 更新 sing-box 版本"
-  echo -e "  ${C_YELLOW}7)${C_RESET} 一键网络诊断"
-  echo -e "  ${C_GREEN}8)${C_RESET} 自定义路由配置"
-  echo -e "  ${C_GREEN}9)${C_RESET} 域名、证书与 SNI"
-  echo -e "  ${C_RED}10)${C_RESET} 卸载"
-  echo -e "  ${C_RED}0)${C_RESET} 退出"
+  echo -e "  ${C_BOLD}【核心部署与运行】${C_RESET}"
+  echo -e "    ${C_BLUE}1)${C_RESET} 安装 / 部署（20 节点，含旧版自动升级）"
+  echo -e "    ${C_GREEN}2)${C_RESET} 查看服务运行状态"
+  echo -e "    ${C_GREEN}3)${C_RESET} 查看节点分享链接"
+  echo -e "    ${C_GREEN}4)${C_RESET} 重启 sing-box 服务"
+  echo
+  echo -e "  ${C_BOLD}【配置与网络管理】${C_RESET}"
+  echo -e "    ${C_GREEN}5)${C_RESET} 一键更换所有端口"
+  echo -e "    ${C_GREEN}6)${C_RESET} 域名、证书与 SNI 设置"
+  echo -e "    ${C_GREEN}7)${C_RESET} 自定义路由与分流规则"
+  echo -e "    ${C_GREEN}8)${C_RESET} 一键开启 BBR 加速"
+  echo
+  echo -e "  ${C_BOLD}【核心与规则维护】${C_RESET}"
+  echo -e "    ${C_YELLOW}9)${C_RESET} 更新 sing-box 核心版本"
+  echo -e "   ${C_YELLOW}10)${C_RESET} 更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)"
+  echo -e "   ${C_YELLOW}11)${C_RESET} 一键系统网络诊断"
+  echo -e "   ${C_RED}12)${C_RESET} 彻底卸载 Sing-Box-Plus"
+  echo
+  echo -e "    ${C_RED}0)${C_RESET} 退出管理脚本"
   hr
 }
 
@@ -2605,38 +3098,17 @@ run_diagnostics(){
   info "诊断完成，报告已保存到：$report"
 }
 
-# 更新 sing-box 到最新版本
+# 更新 sing-box 核心
 update_singbox(){
   ensure_installed_or_hint || return 0
-  local current_ver new_ver
-  current_ver=$("$BIN_PATH" version 2>/dev/null | head -n1 || echo "未知")
-  info "当前版本: $current_ver"
-  info "正在检查最新版本..."
-  
-  # 备份旧版本
-  if [[ -f "$BIN_PATH" ]]; then
-    cp "$BIN_PATH" "${BIN_PATH}.bak" 2>/dev/null || true
-  fi
-  
-  # 删除旧版本以触发重新安装
-  rm -f "$BIN_PATH"
-  
-  if install_singbox; then
-    new_ver=$("$BIN_PATH" version 2>/dev/null | head -n1 || echo "未知")
-    info "更新成功! 新版本: $new_ver"
-    rm -f "${BIN_PATH}.bak" 2>/dev/null || true
-    
-    # 重启服务
-    if systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
-      info "正在重启服务..."
+  info "正在检查 sing-box 核心版本..."
+  if install_singbox 1; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
+      info "正在重启 sing-box 服务..."
       systemctl restart "${SYSTEMD_SERVICE}" || warn "重启服务失败"
     fi
   else
-    warn "更新失败，正在恢复旧版本..."
-    if [[ -f "${BIN_PATH}.bak" ]]; then
-      mv "${BIN_PATH}.bak" "$BIN_PATH"
-      info "已恢复到旧版本"
-    fi
+    warn "更新 sing-box 失败"
   fi
 }
 
@@ -2653,7 +3125,7 @@ rotate_ports(){
 
   save_all_ports          # 重新生成并保存 20 个不重复端口
   write_config            # 用新端口重写 /opt/sing-box/config.json
-  open_firewall           # ★ 新增：把“当前配置中的端口”全部放行
+  open_firewall           # 把“当前配置中的端口”全部放行
   systemctl restart "${SYSTEMD_SERVICE}"
 
   info "已更换端口并重启。"
@@ -2661,17 +3133,97 @@ rotate_ports(){
   read -p "回车返回..." _ || true
 }
 
-
+# ===== 一键彻底卸载与深度清理 =====
 uninstall_all(){
-  systemctl stop "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
-  systemctl disable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
-  systemctl disable --now "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
-  rm -f "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}"
-  rm -f "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_SERVICE}" "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_TIMER}"
-  rm -f "$DNS_HEALTH_BIN" "$EVENT_LOG_BIN"
-  systemctl daemon-reload
-  rm -rf "$SB_DIR"
-  echo -e "${C_GREEN}已卸载并清理完成。${C_RESET}"
+  clear >/dev/null 2>&1 || true
+  hr
+  echo -e " ${C_RED}${C_BOLD}⚠️  Sing-Box-Plus 一键彻底卸载 ⚠️${C_RESET}"
+  hr
+  echo -e "此操作将执行以下清理："
+  echo -e "  1. 停止并注销 sing-box 及 DNS 健康检查所有 systemd 服务与定时器"
+  echo -e "  2. 终止所有运行中的 sing-box、wgcf 残留进程"
+  echo -e "  3. 清理防火墙中放行的全部 20 个节点端口规则 (UFW / Firewalld / iptables)"
+  echo -e "  4. 清理所有安装目录、配置文件、凭证、证书与日志 ($SB_DIR, $SBP_ROOT, /var/lib/sing-box)"
+  echo -e "  5. 清理 sing-box、wgcf 及所有辅助脚本二进制文件"
+  hr
+  read -rp "确定要彻底卸载 Sing-Box-Plus 吗？(y/N): " confirm_uninstall
+  if [[ "${confirm_uninstall,,}" != "y" && "${confirm_uninstall,,}" != "yes" ]]; then
+    info "已取消卸载操作。"
+    return 0
+  fi
+
+  echo
+  info "正在停止并注销服务与定时器..."
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
+    systemctl disable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
+    systemctl stop "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
+    systemctl disable --now "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
+    systemctl stop "${DNS_HEALTH_SERVICE}" >/dev/null 2>&1 || true
+    systemctl disable "${DNS_HEALTH_SERVICE}" >/dev/null 2>&1 || true
+  fi
+
+  rm -f "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" 2>/dev/null || true
+  rm -f "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_SERVICE}" "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_TIMER}" 2>/dev/null || true
+  rm -f /etc/systemd/system/multi-user.target.wants/"${SYSTEMD_SERVICE}" 2>/dev/null || true
+  rm -f /etc/systemd/system/timers.target.wants/"${DNS_HEALTH_TIMER}" 2>/dev/null || true
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+  fi
+
+  info "正在终止残留进程..."
+  killall -9 sing-box wgcf 2>/dev/null || true
+  pkill -9 -f "sing-box" 2>/dev/null || true
+  pkill -9 -f "wgcf" 2>/dev/null || true
+  pkill -9 -f "sing-box-plus" 2>/dev/null || true
+
+  info "正在清理防火墙端口规则..."
+  load_ports || true
+  local rules=()
+  for p in "${PORT_VLESSR:-}" "${PORT_VLESS_GRPCR:-}" "${PORT_TROJANR:-}" "${PORT_VMESS_WS:-}" "${PORT_ANYTLS:-}" \
+           "${PORT_VLESSR_W:-}" "${PORT_VLESS_GRPCR_W:-}" "${PORT_TROJANR_W:-}" "${PORT_VMESS_WS_W:-}" "${PORT_ANYTLS_W:-}"; do
+    [[ -n "$p" ]] && rules+=("${p}/tcp")
+  done
+  for p in "${PORT_HY2:-}" "${PORT_HY2_OBFS:-}" "${PORT_TUIC:-}" \
+           "${PORT_HY2_W:-}" "${PORT_HY2_OBFS_W:-}" "${PORT_TUIC_W:-}"; do
+    [[ -n "$p" ]] && rules+=("${p}/udp")
+  done
+  for p in "${PORT_SS2022:-}" "${PORT_SS:-}" "${PORT_SS2022_W:-}" "${PORT_SS_W:-}"; do
+    [[ -n "$p" ]] && rules+=("${p}/tcp" "${p}/udp")
+  done
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q -E "active|活跃"; then
+    for r in "${rules[@]}"; do ufw delete allow "$r" >/dev/null 2>&1 || true; done
+    ufw reload >/dev/null 2>&1 || true
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    for r in "${rules[@]}"; do firewall-cmd --permanent --remove-port="$r" >/dev/null 2>&1 || true; done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  else
+    for r in "${rules[@]}"; do
+      local p="${r%/*}" proto="${r#*/}"
+      iptables -D INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 || true
+    done
+    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+  fi
+
+  info "正在删除二进制与运行脚本..."
+  rm -f "$BIN_PATH" "${BIN_PATH}.bak" 2>/dev/null || true
+  rm -f "${WGCF_BIN:-/usr/local/bin/wgcf}" 2>/dev/null || true
+  rm -f "$DNS_HEALTH_BIN" "$EVENT_LOG_BIN" 2>/dev/null || true
+  rm -f /usr/local/bin/sbp /usr/bin/sbp 2>/dev/null || true
+
+  info "正在清理数据目录与缓存..."
+  rm -rf "$SB_DIR" 2>/dev/null || true
+  rm -rf "$SBP_ROOT" 2>/dev/null || true
+  rm -rf /var/lib/sing-box 2>/dev/null || true
+  rm -rf /tmp/sing-box* /tmp/sbp* 2>/dev/null || true
+
+  echo
+  hr
+  echo -e " ${C_GREEN}${C_BOLD}✓ Sing-Box-Plus 已彻底卸载并清理完成！${C_RESET}"
+  hr
   exit 0
 }
 
@@ -2686,7 +3238,6 @@ deploy_native(){
   open_firewall
   systemctl restart "${SYSTEMD_SERVICE}" || die "sing-box 启动失败"
   echo; echo -e "${C_BOLD}${C_GREEN}★ 部署完成（20 节点）${C_RESET}"; echo
-  # 打印链接并直接退出
   print_links_grouped
   exit 0
 }
@@ -2827,7 +3378,7 @@ apply_runtime_update(){
 }
 
 update_runtime_components(){
-  [[ "$EUID" -eq 0 ]] || die "轻量更新需要 root 权限，请使用 sudo 运行"
+  [[ "$EUID" -eq 0 || "${SBP_SKIP_ROOT:-0}" -eq 1 || -n "${TEST_ROOT:-}" ]] || die "轻量更新需要 root 权限，请使用 sudo 运行"
   [[ "$SBP_SCRIPT_PATH" == /* ]] || die "SBP_SCRIPT_PATH 必须是绝对路径"
   [[ "$SYSTEMD_UNIT_DIR" == /* ]] || die "SYSTEMD_UNIT_DIR 必须是绝对路径"
   [[ -s "$CONF_JSON" ]] || die "未发现已有节点配置：$CONF_JSON"
@@ -2847,8 +3398,10 @@ update_runtime_components(){
   [[ -s "$CONF_JSON" ]] || die "env.conf 指向的节点配置不存在：$CONF_JSON"
 
   mkdir -p "$SB_DIR" || die "无法访问安装目录：$SB_DIR"
-  exec 8>"$SB_DIR/.runtime-update.lock"
-  flock -n 8 || die "另一个轻量更新正在进行，请稍后重试"
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"$SB_DIR/.runtime-update.lock"
+    flock -n 8 || die "另一个轻量更新正在进行，请稍后重试"
+  fi
 
   old_umask=$(umask)
   umask 077
@@ -2907,8 +3460,13 @@ usage(){
   cat <<EOF
 用法：
   bash sbp.sh                    打开交互式管理菜单
+  sudo bash sbp.sh --status      查看当前服务运行状态
+  sudo bash sbp.sh --update-core 检查并更新 sing-box 核心版本
+  sudo bash sbp.sh --update-geofiles
+                                 更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)
   sudo bash sbp.sh --update-runtime
                                  轻量更新管理脚本与 DNS 运行时组件
+  sudo bash sbp.sh --uninstall   彻底卸载 Sing-Box-Plus
   bash sbp.sh --help             显示本帮助
 
 轻量更新不会改写节点配置、凭证或端口，也不会主动重启 sing-box。
@@ -2927,44 +3485,46 @@ menu(){
   banner
   read -rp "选择: " op || { echo; exit 0; }
   case "${op:-}" in
-  1)
-  sbp_bootstrap                                     # 依赖/二进制回退
-  set +e
-  echo -e "${C_BLUE}[信息] 正在检查 sing-box 安装状态...${C_RESET}"
-  if ! install_singbox; then
-    echo -e "${C_RED}[错误] sing-box 安装失败${C_RESET}"
-    exit 1
-  fi
-  ensure_warp_profile        || true
-  if ! write_config; then
-    echo -e "${C_RED}[错误] 生成配置失败${C_RESET}"
-    exit 1
-  fi
-  if ! "$BIN_PATH" check -c "$CONF_JSON"; then
-    echo -e "${C_RED}[错误] 配置检查失败，未重启服务${C_RESET}"
-    exit 1
-  fi
-  write_systemd              || { echo -e "${C_RED}[错误] systemd 服务写入失败${C_RESET}"; exit 1; }
-  open_firewall              || true
-  if ! systemctl restart "${SYSTEMD_SERVICE}"; then
-    systemctl --no-pager status "${SYSTEMD_SERVICE}" | sed -n '1,12p' || true
-    echo -e "${C_RED}[错误] sing-box 启动失败，请运行 7) 一键网络诊断${C_RESET}"
-    exit 1
-  fi
-  set -e
-  print_links_grouped
-  exit 0
-  ;;
+    1)
+      sbp_bootstrap                                     # 依赖/二进制回退
+      set +e
+      info "正在检查并部署 sing-box..."
+      if ! install_singbox; then
+        warn "sing-box 安装/升级失败"
+        exit 1
+      fi
+      ensure_warp_profile || true
+      if ! write_config; then
+        warn "生成配置失败"
+        exit 1
+      fi
+      if ! "$BIN_PATH" check -c "$CONF_JSON"; then
+        warn "配置检查失败，未重启服务"
+        exit 1
+      fi
+      write_systemd || { warn "systemd 服务写入失败"; exit 1; }
+      open_firewall || true
+      if ! systemctl restart "${SYSTEMD_SERVICE}"; then
+        systemctl --no-pager status "${SYSTEMD_SERVICE}" | sed -n '1,12p' || true
+        warn "sing-box 启动失败，请运行 11) 一键网络诊断"
+        exit 1
+      fi
+      set -e
+      print_links_grouped
+      exit 0
+      ;;
     
-    2) if ensure_installed_or_hint; then print_links_grouped; exit 0; fi ;;
-    3) if ensure_installed_or_hint; then restart_service; fi; read -rp "回车返回..." _ || true; menu ;;
-   4) if ensure_installed_or_hint; then rotate_ports; fi; menu ;;
-    5) enable_bbr; read -rp "回车返回..." _ || true; menu ;;
-    6) update_singbox; read -rp "回车返回..." _ || true; menu ;;
-    7) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
-    8) custom_route_menu; menu ;;
-    9) sbp_bootstrap; connection_settings_menu; menu ;;
-    10) uninstall_all ;; # 直接退出
+    2) show_service_status; read -rp "回车返回..." _ || true; menu ;;
+    3) if ensure_installed_or_hint; then print_links_grouped; exit 0; fi ;;
+    4) if ensure_installed_or_hint; then restart_service; fi; read -rp "回车返回..." _ || true; menu ;;
+    5) if ensure_installed_or_hint; then rotate_ports; fi; menu ;;
+    6) sbp_bootstrap; connection_settings_menu; menu ;;
+    7) custom_route_menu; menu ;;
+    8) enable_bbr; read -rp "回车返回..." _ || true; menu ;;
+    9) update_singbox; read -rp "回车返回..." _ || true; menu ;;
+    10) update_geofiles; read -rp "回车返回..." _ || true; menu ;;
+    11) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
+    12) uninstall_all ;;
     0|q|Q) exit 0 ;;
     *) echo -e "${C_YELLOW}无效选项，请重新选择${C_RESET}"; sleep 1; menu ;;
   esac
@@ -2974,7 +3534,11 @@ menu(){
 main(){
   case "${1:-}" in
     "") menu ;;
+    --status) show_service_status ;;
+    --update-core) update_singbox ;;
+    --update-geofiles) update_geofiles ;;
     --update-runtime) update_runtime_components ;;
+    --uninstall) uninstall_all ;;
     -h|--help) usage ;;
     *)
       echo "未知参数：$1" >&2
