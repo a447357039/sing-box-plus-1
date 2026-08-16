@@ -1963,12 +1963,12 @@ if ! jq --arg dns "$selected" '
   .dns.final = $dns
   | .route.default_domain_resolver = $dns
   | .outbounds = ((.outbounds // []) | map(
-      if .tag == "direct-ipv4" then .domain_resolver = {server:$dns, strategy:"ipv4_only"} | .domain_strategy = "ipv4_only"
-      elif .tag == "direct-ipv6" then .domain_resolver = {server:$dns, strategy:"ipv6_only"} | .domain_strategy = "ipv6_only"
-      elif (.domain_resolver | type == "object" and .domain_resolver.strategy != null) then .domain_resolver.server = $dns
-      elif .type == "direct" then .domain_resolver = $dns
-      elif (.domain_resolver | type == "string") then .domain_resolver = $dns
-      else . end
+      if .tag == "direct-ipv4" then .domain_resolver = {server:$dns, strategy:"ipv4_only"} | del(.domain_strategy)
+      elif .tag == "direct-ipv6" then .domain_resolver = {server:$dns, strategy:"ipv6_only"} | del(.domain_strategy)
+      elif (.domain_resolver | type == "object" and .domain_resolver.strategy != null) then .domain_resolver.server = $dns | del(.domain_strategy)
+      elif .type == "direct" then .domain_resolver = $dns | del(.domain_strategy)
+      elif (.domain_resolver | type == "string") then .domain_resolver = $dns | del(.domain_strategy)
+      else . | del(.domain_strategy) end
     ))
   | .endpoints = ((.endpoints // []) | map(if .tag == "warp" then .domain_resolver = $dns else . end))
 ' "$CONF_JSON" > "$tmp"; then
@@ -2170,16 +2170,19 @@ write_config(){
     . as $ob
     | (($ob.domain_resolver | objects | .server) // ($ob.domain_resolver | strings) // "dns-doh-primary") as $server
     | ($ob.domain_strategy // ($ob.domain_resolver | objects | .strategy) // "") as $strat
+    | ($ob | del(.domain_strategy)) as $clean_ob
     | if $strat == "ipv4_only" then
-        $ob + {domain_strategy:"ipv4_only", domain_resolver:{server:$server, strategy:"ipv4_only"}}
+        $clean_ob + {domain_resolver:{server:$server, strategy:"ipv4_only"}}
       elif $strat == "ipv6_only" then
-        $ob + {domain_strategy:"ipv6_only", domain_resolver:{server:$server, strategy:"ipv6_only"}}
+        $clean_ob + {domain_resolver:{server:$server, strategy:"ipv6_only"}}
       elif $strat == "prefer_ipv6" then
-        $ob + {domain_strategy:"prefer_ipv6", domain_resolver:{server:$server, strategy:"prefer_ipv6"}}
+        $clean_ob + {domain_resolver:{server:$server, strategy:"prefer_ipv6"}}
       elif $strat == "prefer_ipv4" then
-        $ob + {domain_strategy:"prefer_ipv4", domain_resolver:$server}
+        $clean_ob + {domain_resolver:$server}
       else
-        $ob + {domain_strategy:"prefer_ipv4", domain_resolver:$server}
+        if ($clean_ob.domain_resolver == null or $clean_ob.domain_resolver == "") then
+          $clean_ob + {domain_resolver:$server}
+        else $clean_ob end
       end;
 
   def custom_outbounds:
@@ -2213,17 +2216,15 @@ write_config(){
     custom_route_rules + (if warp_ready then [warp_inbound_rule] else [] end);
 
   def direct_outbound:
-    {type:"direct", tag:"direct", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, domain_strategy:"prefer_ipv4", domain_resolver:"dns-doh-primary"};
+    {type:"direct", tag:"direct", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, domain_resolver:"dns-doh-primary"};
 
   def direct_ipv4_outbound:
     ({type:"direct", tag:"direct-ipv4", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI,
-      domain_strategy:"ipv4_only",
       domain_resolver:{server:"dns-doh-primary", strategy:"ipv4_only"}}
       + (if $BIND4 != "" then {inet4_bind_address:$BIND4, bind_address_no_port:true} else {} end));
 
   def direct_ipv6_outbound:
     ({type:"direct", tag:"direct-ipv6", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI,
-      domain_strategy:"ipv6_only",
       domain_resolver:{server:"dns-doh-primary", strategy:"ipv6_only"}}
       + (if $BIND6 != "" then {inet6_bind_address:$BIND6, bind_address_no_port:true} else {} end));
 
@@ -2446,7 +2447,7 @@ print_custom_routes(){
   echo -e "${C_CYAN}当前本机出口:${C_RESET} IPv4=${ip4:-未检测到} IPv6=${ip6:-未检测到}"
   echo -e "${C_CYAN}非 Warp 节点默认出口:${C_RESET} ${def_outbound}"
   echo
-  jq -r --arg def "$def_outbound" '
+  jq -r --arg cur_default "$def_outbound" '
     def match_text:
       [(.domain // [] | map("domain:" + .))[],
        (.domain_suffix // [] | map("suffix:" + .))[],
@@ -2471,7 +2472,7 @@ print_custom_routes(){
     (if ((.outbounds // []) | length) == 0 then
       "  （无）"
     else
-      (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)] [\(.value | ip_strat)]" + (if .value.tag == $def then " (当前默认出口)" else "" end))
+      (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)] [\(.value | ip_strat)]" + (if .value.tag == $cur_default then " (当前默认出口)" else "" end))
     end)
   ' "$ROUTE_JSON"
 }
@@ -2614,13 +2615,13 @@ import_custom_route_outbound(){
     outbound="$(printf '%s' "$raw" | jq -c --arg src "$src_tag" --arg tag "$tag" '
       .outbounds[] | select(.tag == $src) | .tag = $tag
       | if (has("server") and (has("domain_resolver") | not)) then .domain_resolver = "dns-doh-primary" else . end
-      | if (has("domain_strategy") | not) then .domain_strategy = "prefer_ipv4" else . end
+      | del(.domain_strategy)
     ' | head -n1)"
   elif printf '%s' "$raw" | jq -e 'type == "object" and (.type | type == "string")' >/dev/null 2>&1; then
     outbound="$(printf '%s' "$raw" | jq -c --arg tag "$tag" '
       .tag = $tag
       | if (has("server") and (has("domain_resolver") | not)) then .domain_resolver = "dns-doh-primary" else . end
-      | if (has("domain_strategy") | not) then .domain_strategy = "prefer_ipv4" else . end
+      | del(.domain_strategy)
     ')"
   else
     outbound="$(share_link_to_outbound "$raw" "$tag" 2>/dev/null || true)"
@@ -2749,7 +2750,7 @@ set_outbound_ip_strategy(){
   fi
 
   echo "请选择要配置 IP 栈策略的出口节点："
-  local idx=1 tag choice strat strat_ds strat_label route_bak tmp
+  local idx=1 tag choice strat strat_label route_bak tmp
   for tag in "${imported[@]}"; do
     local cur_strat
     cur_strat="$(jq -r --arg tag "$tag" '
@@ -2786,22 +2787,18 @@ set_outbound_ip_strategy(){
   case "$strat" in
     1)
       dns_obj='"dns-doh-primary"'
-      strat_ds="prefer_ipv4"
       strat_label="双栈 (优先 IPv4)"
       ;;
     2)
       dns_obj='{"server":"dns-doh-primary","strategy":"ipv4_only"}'
-      strat_ds="ipv4_only"
       strat_label="仅 IPv4"
       ;;
     3)
       dns_obj='{"server":"dns-doh-primary","strategy":"ipv6_only"}'
-      strat_ds="ipv6_only"
       strat_label="仅 IPv6"
       ;;
     4)
       dns_obj='{"server":"dns-doh-primary","strategy":"prefer_ipv6"}'
-      strat_ds="prefer_ipv6"
       strat_label="双栈 (优先 IPv6)"
       ;;
     *)
@@ -2813,10 +2810,10 @@ set_outbound_ip_strategy(){
   route_bak="$(mktemp)"
   cp "$ROUTE_JSON" "$route_bak"
   tmp="$(mktemp)"
-  if jq -c --arg tag "$tag" --argjson dns "$dns_obj" --arg ds "$strat_ds" '
+  if jq -c --arg tag "$tag" --argjson dns "$dns_obj" '
     .outbounds = ((.outbounds // []) | map(
       if .tag == $tag then
-        .domain_resolver = $dns | .domain_strategy = $ds
+        .domain_resolver = $dns | del(.domain_strategy)
       else . end
     ))
   ' "$ROUTE_JSON" > "$tmp"; then
