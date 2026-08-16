@@ -222,16 +222,20 @@ jq --argjson ob "$out_socks5" '.outbounds += [($ob + {tag: "node-strat"})]' "$RO
 # 切换为仅 IPv4
 (printf '%s\n' "1" "2" | set_outbound_ip_strategy) > "$test_root/strat_v4.log" 2>&1 || true
 assert_equal "ipv4_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$ROUTE_JSON")" "strategy must be ipv4_only"
+assert_equal "ipv4_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | .domain_strategy // ""' "$ROUTE_JSON")" "domain_strategy must be ipv4_only"
 write_config
-assert_equal "ipv4_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$CONF_JSON")" "config.json must reflect ipv4_only"
+assert_equal "ipv4_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$CONF_JSON")" "config.json must reflect ipv4_only resolver strategy"
+assert_equal "ipv4_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | .domain_strategy // ""' "$CONF_JSON")" "config.json must reflect ipv4_only domain_strategy"
 
 # 切换为仅 IPv6
 (printf '%s\n' "1" "3" | set_outbound_ip_strategy) > "$test_root/strat_v6.log" 2>&1 || true
 assert_equal "ipv6_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$ROUTE_JSON")" "strategy must be ipv6_only"
+assert_equal "ipv6_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | .domain_strategy // ""' "$ROUTE_JSON")" "domain_strategy must be ipv6_only"
 
 # 切换为双栈优先 IPv4
 (printf '%s\n' "1" "1" | set_outbound_ip_strategy) > "$test_root/strat_dual.log" 2>&1 || true
 assert_equal "dns-doh-primary" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | .domain_resolver' "$ROUTE_JSON")" "strategy must be dual-stack primary"
+assert_equal "prefer_ipv4" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | .domain_strategy' "$ROUTE_JSON")" "domain_strategy must be prefer_ipv4"
 
 # 8. 测试 uninstall_all 交互取消与确认
 (echo "n" | uninstall_all) > "$test_root/uninstall_cancel.log" 2>&1 || true
