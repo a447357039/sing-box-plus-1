@@ -1109,6 +1109,15 @@ tls_ca_bundle(){
   return 1
 }
 
+# openssl x509 -checkhost 无论主机名是否匹配都以 0 退出，判定结果只写到 stdout，
+# 因此必须解析输出而不能依赖退出码。
+cert_matches_host(){
+  local crt=$1 host=$2 out
+  [[ -s "$crt" && -n "$host" ]] || return 1
+  out="$(openssl x509 -in "$crt" -noout -checkhost "$host" 2>/dev/null)" || return 1
+  [[ "$out" == *"does match certificate"* && "$out" != *"NOT match"* ]]
+}
+
 validate_manual_certificate(){
   local quiet="${1:-false}" cert_pub key_pub bundle
   local fail_prefix="手动证书校验失败："
@@ -1137,7 +1146,7 @@ validate_manual_certificate(){
     [[ "$quiet" == true ]] || warn "${fail_prefix}证书已经过期或尚未生效"
     return 1
   fi
-  if ! openssl x509 -in "$TLS_CERT_PATH" -noout -checkhost "$TLS_DOMAIN" >/dev/null 2>&1; then
+  if ! cert_matches_host "$TLS_CERT_PATH" "$TLS_DOMAIN"; then
     [[ "$quiet" == true ]] || warn "${fail_prefix}证书不包含域名 $TLS_DOMAIN"
     return 1
   fi
@@ -1262,7 +1271,7 @@ mk_cert(){
   local cert_name="$REALITY_SERVER"
 
   if [[ -s "$crt" && -s "$key" ]] \
-      && openssl x509 -in "$crt" -noout -checkhost "$cert_name" >/dev/null 2>&1 \
+      && cert_matches_host "$crt" "$cert_name" \
       && openssl pkey -in "$key" -noout >/dev/null 2>&1; then
     cert_pub="$(openssl x509 -in "$crt" -pubkey -noout 2>/dev/null \
       | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null)"
@@ -1278,7 +1287,7 @@ mk_cert(){
   if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes \
       -keyout "$tmp_dir/key.pem" -out "$tmp_dir/fullchain.pem" -subj "/CN=$cert_name" \
       -addext "subjectAltName=DNS:$cert_name" >/dev/null 2>&1 \
-      || ! openssl x509 -in "$tmp_dir/fullchain.pem" -noout -checkhost "$cert_name" >/dev/null 2>&1 \
+      || ! cert_matches_host "$tmp_dir/fullchain.pem" "$cert_name" \
       || ! openssl pkey -in "$tmp_dir/key.pem" -noout >/dev/null 2>&1; then
     rm -rf "$tmp_dir"
     warn "生成自签证书失败"

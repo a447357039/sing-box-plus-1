@@ -117,7 +117,13 @@ esac
 
 prepare_tls_certificate
 old_cert_hash=$(sha256sum "$TLS_CERT_PATH" | awk '{print $1}')
-openssl x509 -in "$TLS_CERT_PATH" -noout -checkhost www.lovelive-anime.jp >/dev/null
+cert_matches_host "$TLS_CERT_PATH" www.lovelive-anime.jp \
+  || { echo "FAIL: managed cert must match the current SNI" >&2; exit 1; }
+# openssl -checkhost 恒以 0 退出，负向用例确保判定读的是输出而不是退出码
+if cert_matches_host "$TLS_CERT_PATH" edge.example.com; then
+  echo "FAIL: cert_matches_host must reject a hostname absent from the certificate" >&2
+  exit 1
+fi
 
 configure_reality_sni <<< 'Edge.Example.COM.'
 assert_equal edge.example.com "$REALITY_SERVER" \
@@ -129,7 +135,8 @@ if [[ "$old_cert_hash" == "$new_cert_hash" ]]; then
   echo "FAIL: changing Reality SNI must regenerate the managed self-signed certificate" >&2
   exit 1
 fi
-openssl x509 -in "$TLS_CERT_PATH" -noout -checkhost edge.example.com >/dev/null
+cert_matches_host "$TLS_CERT_PATH" edge.example.com \
+  || { echo "FAIL: regenerated cert must match the updated SNI" >&2; exit 1; }
 print_links_grouped > "$test_root/updated-sni-links.log"
 assert_equal 8 "$(grep -c 'insecure=1&sni=edge.example.com' "$SHARE_LINKS_FILE")" \
   "certificate-backed links must follow the updated self-signed SNI and allow insecure"
