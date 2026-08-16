@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v3.0.0
+#  Version: v3.1.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -281,6 +281,8 @@ DNS_HEALTH_SERVICE=${DNS_HEALTH_SERVICE:-sing-box-plus-dns-health.service}
 DNS_HEALTH_TIMER=${DNS_HEALTH_TIMER:-sing-box-plus-dns-health.timer}
 SYSTEMD_UNIT_DIR=${SYSTEMD_UNIT_DIR:-/etc/systemd/system}
 SBP_SCRIPT_PATH=${SBP_SCRIPT_PATH:-/root/sbp.sh}
+SBP_REPO=${SBP_REPO:-yayitinyu/sing-box-plus}
+SBP_BRANCH=${SBP_BRANCH:-main}
 ROUTE_JSON=${ROUTE_JSON:-$SB_DIR/routes.json}
 SHARE_LINKS_FILE=${SHARE_LINKS_FILE:-$SB_DIR/share-links.txt}
 
@@ -328,7 +330,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.0.0"
+SCRIPT_VERSION="v3.1.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -2454,13 +2456,6 @@ print_custom_routes(){
        (.domain_keyword // [] | map("keyword:" + .))[],
        (.domain_regex // [] | map("regex:" + .))[],
        (.rule_set // [] | map("rule-set:" + .))[]] | join(", ");
-    def ip_strat:
-      ((.domain_resolver | objects | .strategy) // .domain_strategy // "") as $st
-      | if $st == "ipv4_only" then "仅 IPv4"
-        elif $st == "ipv6_only" then "仅 IPv6"
-        elif $st == "prefer_ipv6" then "双栈 (优先 IPv6)"
-        elif $st == "prefer_ipv4" then "双栈 (优先 IPv4)"
-        else "双栈" end;
     "自定义路由规则:",
     (if ((.rules // []) | length) == 0 then
       "  （无）"
@@ -2472,7 +2467,7 @@ print_custom_routes(){
     (if ((.outbounds // []) | length) == 0 then
       "  （无）"
     else
-      (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)] [\(.value | ip_strat)]" + (if .value.tag == $cur_default then " (当前默认出口)" else "" end))
+      (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)]" + (if .value.tag == $cur_default then " (当前默认出口)" else "" end))
     end)
   ' "$ROUTE_JSON"
 }
@@ -2492,17 +2487,7 @@ select_route_outbound(){
   echo "  4) 本机 IPv6 出口（direct-ipv6：仅 IPv6 直连，当前 ${ip6:-未检测到}）"
   idx=5
   for tag in "${imported[@]}"; do
-    local cur_strat
-    cur_strat="$(jq -r --arg tag "$tag" '
-      .outbounds[] | select(.tag == $tag) |
-      ((.domain_resolver | objects | .strategy) // .domain_strategy // "") as $st |
-      if $st == "ipv4_only" then "仅 IPv4"
-      elif $st == "ipv6_only" then "仅 IPv6"
-      elif $st == "prefer_ipv6" then "双栈 (优先 IPv6)"
-      elif $st == "prefer_ipv4" then "双栈 (优先 IPv4)"
-      else "双栈" end
-    ' "$ROUTE_JSON" 2>/dev/null || echo "双栈")"
-    echo "  ${idx}) 导入出口：${tag} [${cur_strat}]"
+    echo "  ${idx}) 导入出口：${tag}"
     idx=$((idx+1))
   done
   read -rp "选择出口: " choice || return 1
@@ -2518,11 +2503,12 @@ select_route_outbound(){
       SBP_SELECTED_OUTBOUND="direct"
       ;;
     3)
-      [[ -n "$ip4" ]] || warn "未检测到本机 IPv4，规则仍会使用 ipv4_only 解析策略。"
+      [[ -n "$ip4" ]] || warn "未检测到本机 IPv4，该出口将无法建立连接。"
       SBP_SELECTED_OUTBOUND="direct-ipv4"
       ;;
     4)
-      [[ -n "$ip6" ]] || warn "未检测到本机 IPv6，规则仍会使用 ipv6_only 解析策略。"
+      [[ -n "$ip6" ]] || warn "未检测到本机 IPv6，该出口将无法建立连接。"
+      warn "仅 IPv6 出口无法访问没有 AAAA 记录的站点；客户端直接以 IPv4 地址（而非域名）发起的连接也不受此设置约束。"
       SBP_SELECTED_OUTBOUND="direct-ipv6"
       ;;
     *)
@@ -2667,20 +2653,10 @@ set_custom_default_outbound(){
   echo "  4) 本机 WARP 出口（warp：Cloudflare WARP 双栈）"
   idx=5
   for tag in "${imported[@]}"; do
-    local cur_strat
-    cur_strat="$(jq -r --arg tag "$tag" '
-      .outbounds[] | select(.tag == $tag) |
-      ((.domain_resolver | objects | .strategy) // .domain_strategy // "") as $st |
-      if $st == "ipv4_only" then "仅 IPv4"
-      elif $st == "ipv6_only" then "仅 IPv6"
-      elif $st == "prefer_ipv6" then "双栈 (优先 IPv6)"
-      elif $st == "prefer_ipv4" then "双栈 (优先 IPv4)"
-      else "双栈" end
-    ' "$ROUTE_JSON" 2>/dev/null || echo "双栈")"
     if [[ "$tag" == "$current_outbound" ]]; then
-      echo "  ${idx}) 导入出口：${tag} [${cur_strat}] (当前选中)"
+      echo "  ${idx}) 导入出口：${tag} (当前选中)"
     else
-      echo "  ${idx}) 导入出口：${tag} [${cur_strat}]"
+      echo "  ${idx}) 导入出口：${tag}"
     fi
     idx=$((idx+1))
   done
@@ -2691,11 +2667,12 @@ set_custom_default_outbound(){
   case "$choice" in
     1) target="direct" ;;
     2)
-      [[ -n "$ip4" ]] || warn "未检测到本机 IPv4，规则仍会使用 ipv4_only 解析策略。"
+      [[ -n "$ip4" ]] || warn "未检测到本机 IPv4，该出口将无法建立连接。"
       target="direct-ipv4"
       ;;
     3)
-      [[ -n "$ip6" ]] || warn "未检测到本机 IPv6，规则仍会使用 ipv6_only 解析策略。"
+      [[ -n "$ip6" ]] || warn "未检测到本机 IPv6，该出口将无法建立连接。"
+      warn "仅 IPv6 出口无法访问没有 AAAA 记录的站点；客户端直接以 IPv4 地址（而非域名）发起的连接也不受此设置约束。"
       target="direct-ipv6"
       ;;
     4)
@@ -2719,7 +2696,10 @@ set_custom_default_outbound(){
     return 1
   fi
 
-  if [[ "$target" == "$current_outbound" ]]; then
+  # current_outbound 在键缺失时是回落值 direct，此时即使选中 direct 也必须落盘，
+  # 否则设置看似成功却从未写入 routes.json。
+  if [[ "$target" == "$current_outbound" ]] \
+     && jq -e 'has("default_outbound")' "$ROUTE_JSON" >/dev/null 2>&1; then
     info "出口未发生变化：${target}"
     return 0
   fi
@@ -2736,95 +2716,6 @@ set_custom_default_outbound(){
     rm -f "$tmp"
     cp "$route_bak" "$ROUTE_JSON"
     warn "保存出口配置失败。"
-  fi
-  rm -f "$route_bak"
-}
-
-set_outbound_ip_strategy(){
-  ensure_route_file
-  local -a imported
-  mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$ROUTE_JSON" | tr -d '\r')
-  if (( ${#imported[@]} == 0 )); then
-    warn "暂无导入的远程出口节点，请先导入节点。"
-    return 0
-  fi
-
-  echo "请选择要配置 IP 栈策略的出口节点："
-  local idx=1 tag choice strat strat_label route_bak tmp
-  for tag in "${imported[@]}"; do
-    local cur_strat
-    cur_strat="$(jq -r --arg tag "$tag" '
-      .outbounds[] | select(.tag == $tag) |
-      ((.domain_resolver | objects | .strategy) // .domain_strategy // "") as $st |
-      if $st == "ipv4_only" then "仅 IPv4"
-      elif $st == "ipv6_only" then "仅 IPv6"
-      elif $st == "prefer_ipv6" then "双栈 (优先 IPv6)"
-      elif $st == "prefer_ipv4" then "双栈 (优先 IPv4)"
-      else "双栈" end
-    ' "$ROUTE_JSON" 2>/dev/null || echo "双栈")"
-    echo "  ${idx}) ${tag} [当前: ${cur_strat}]"
-    idx=$((idx+1))
-  done
-  read -rp "选择节点编号: " choice || return 1
-  choice="${choice//$'\r'/}"
-  [[ "$choice" =~ ^[0-9]+$ ]] || { warn "编号无效"; return 1; }
-  idx=$((choice-1))
-  if (( idx < 0 || idx >= ${#imported[@]} )); then
-    warn "选择超出范围"; return 1
-  fi
-  tag="${imported[$idx]}"
-
-  echo
-  echo "为 [${tag}] 选择 IP 栈出口策略："
-  echo "  1) 双栈（默认，优先 IPv4）"
-  echo "  2) 仅 IPv4 出口（ipv4_only）"
-  echo "  3) 仅 IPv6 出口（ipv6_only）"
-  echo "  4) 双栈（优先 IPv6，prefer_ipv6）"
-  read -rp "选择策略 [1-4]: " strat || return 1
-  strat="${strat//$'\r'/}"
-
-  local dns_obj
-  case "$strat" in
-    1)
-      dns_obj='"dns-doh-primary"'
-      strat_label="双栈 (优先 IPv4)"
-      ;;
-    2)
-      dns_obj='{"server":"dns-doh-primary","strategy":"ipv4_only"}'
-      strat_label="仅 IPv4"
-      ;;
-    3)
-      dns_obj='{"server":"dns-doh-primary","strategy":"ipv6_only"}'
-      strat_label="仅 IPv6"
-      ;;
-    4)
-      dns_obj='{"server":"dns-doh-primary","strategy":"prefer_ipv6"}'
-      strat_label="双栈 (优先 IPv6)"
-      ;;
-    *)
-      warn "无效策略选择"
-      return 1
-      ;;
-  esac
-
-  route_bak="$(mktemp)"
-  cp "$ROUTE_JSON" "$route_bak"
-  tmp="$(mktemp)"
-  if jq -c --arg tag "$tag" --argjson dns "$dns_obj" '
-    .outbounds = ((.outbounds // []) | map(
-      if .tag == $tag then
-        .domain_resolver = $dns | del(.domain_strategy)
-      else . end
-    ))
-  ' "$ROUTE_JSON" > "$tmp"; then
-    mv "$tmp" "$ROUTE_JSON"
-    if apply_custom_routing "$route_bak"; then
-      info "节点 [${tag}] IP 栈策略已更新为：${strat_label}"
-    fi
-  else
-    rm -f "$tmp"
-    cp "$route_bak" "$ROUTE_JSON"
-    warn "保存 IP 栈策略失败。"
   fi
   rm -f "$route_bak"
 }
@@ -2921,10 +2812,9 @@ custom_route_menu(){
     echo -e "  ${C_GREEN}1)${C_RESET} 添加网址 / geosite 路由规则"
     echo -e "  ${C_GREEN}2)${C_RESET} 导入其他 VPS 出口节点"
     echo -e "  ${C_GREEN}3)${C_RESET} 设置非 Warp 节点默认出口 (V4 / V6 / 双栈 / 导入节点)"
-    echo -e "  ${C_GREEN}4)${C_RESET} 设置出口节点 IP 栈策略 (双栈 / 仅 IPv4 / 仅 IPv6)"
-    echo -e "  ${C_YELLOW}5)${C_RESET} 删除路由规则"
-    echo -e "  ${C_YELLOW}6)${C_RESET} 删除导入出口"
-    echo -e "  ${C_RED}7)${C_RESET} 清空自定义路由规则"
+    echo -e "  ${C_YELLOW}4)${C_RESET} 删除路由规则"
+    echo -e "  ${C_YELLOW}5)${C_RESET} 删除导入出口"
+    echo -e "  ${C_RED}6)${C_RESET} 清空自定义路由规则"
     echo -e "  ${C_RED}0)${C_RESET} 返回主菜单"
     hr
     read -rp "选择: " op || return 0
@@ -2932,10 +2822,9 @@ custom_route_menu(){
       1) add_custom_route_rule; read -rp "回车继续..." _ || true ;;
       2) import_custom_route_outbound; read -rp "回车继续..." _ || true ;;
       3) set_custom_default_outbound; read -rp "回车继续..." _ || true ;;
-      4) set_outbound_ip_strategy; read -rp "回车继续..." _ || true ;;
-      5) remove_custom_route_rule; read -rp "回车继续..." _ || true ;;
-      6) remove_custom_route_outbound; read -rp "回车继续..." _ || true ;;
-      7) clear_custom_route_rules; read -rp "回车继续..." _ || true ;;
+      4) remove_custom_route_rule; read -rp "回车继续..." _ || true ;;
+      5) remove_custom_route_outbound; read -rp "回车继续..." _ || true ;;
+      6) clear_custom_route_rules; read -rp "回车继续..." _ || true ;;
       0|q|Q) return 0 ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
@@ -3379,8 +3268,9 @@ banner(){
   echo -e "  ${C_BOLD}【核心与规则维护】${C_RESET}"
   echo -e "    ${C_YELLOW}9)${C_RESET} 更新 sing-box 核心版本"
   echo -e "   ${C_YELLOW}10)${C_RESET} 更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)"
-  echo -e "   ${C_YELLOW}11)${C_RESET} 一键系统网络诊断"
-  echo -e "   ${C_RED}12)${C_RESET} 彻底卸载 Sing-Box-Plus"
+  echo -e "   ${C_YELLOW}11)${C_RESET} 从 GitHub 更新管理脚本"
+  echo -e "   ${C_YELLOW}12)${C_RESET} 一键系统网络诊断"
+  echo -e "   ${C_RED}13)${C_RESET} 彻底卸载 Sing-Box-Plus"
   echo
   echo -e "    ${C_RED}0)${C_RESET} 退出管理脚本"
   hr
@@ -3851,6 +3741,77 @@ update_runtime_components(){
   fi
 }
 
+# 按内容而非 HTTP 状态码判定，避免把 404 页面或被劫持的响应当成脚本装上去
+validate_script_file(){
+  local f=$1
+  [[ -s "$f" ]] || return 1
+  head -n1 "$f" | grep -q '^#!.*bash' || return 1
+  grep -q '^SCRIPT_VERSION=' "$f" || return 1
+  grep -q '^update_runtime_components()' "$f" || return 1
+  bash -n "$f" 2>/dev/null || return 1
+}
+
+remote_script_version(){
+  sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p' "$1" | head -n1
+}
+
+fetch_remote_script(){
+  local dest=$1 base url
+  base="https://raw.githubusercontent.com/${SBP_REPO}/${SBP_BRANCH}/sing-box-plus.sh"
+  for url in \
+    "$base" \
+    "https://ghproxy.net/${base}" \
+    "https://raw.gitmirror.com/${SBP_REPO}/${SBP_BRANCH}/sing-box-plus.sh"
+  do
+    if curl -fsSL --connect-timeout 10 -m 120 -o "$dest" "$url" 2>/dev/null \
+       && validate_script_file "$dest"; then
+      info "已下载：${url}"
+      return 0
+    fi
+    rm -f "$dest"
+  done
+  return 1
+}
+
+update_script_from_remote(){
+  [[ "$EUID" -eq 0 || "${SBP_SKIP_ROOT:-0}" -eq 1 || -n "${TEST_ROOT:-}" ]] \
+    || die "更新管理脚本需要 root 权限，请使用 sudo 运行"
+  command -v curl >/dev/null 2>&1 || die "缺少 curl，无法下载更新"
+
+  local tmp_dir tmp remote_ver rc=0
+  tmp_dir=$(mktemp -d) || die "无法创建临时目录"
+  tmp="$tmp_dir/sing-box-plus.sh"
+
+  info "正在从 ${SBP_REPO}@${SBP_BRANCH} 获取最新管理脚本..."
+  if ! fetch_remote_script "$tmp"; then
+    rm -rf "$tmp_dir"
+    die "下载或校验管理脚本失败，请检查网络后重试"
+  fi
+
+  remote_ver="$(remote_script_version "$tmp")"
+  if [[ -z "$remote_ver" ]]; then
+    rm -rf "$tmp_dir"
+    die "无法识别远程脚本版本"
+  fi
+
+  info "当前版本：${SCRIPT_VERSION}    远程版本：${remote_ver}"
+  if [[ "$remote_ver" == "$SCRIPT_VERSION" && "${SBP_FORCE_UPDATE:-0}" != "1" ]]; then
+    rm -rf "$tmp_dir"
+    info "已是最新版本，无需更新。如需强制覆盖：SBP_FORCE_UPDATE=1"
+    return 0
+  fi
+
+  # 交给新脚本自己执行轻量更新，直接复用其备份 / 回滚 / MainPID 校验流程
+  chmod 0755 "$tmp"
+  info "正在应用更新（含自动备份与失败回滚）..."
+  bash "$tmp" --update-runtime || rc=$?
+  rm -rf "$tmp_dir"
+  if [[ "$rc" -eq 0 ]]; then
+    info "管理脚本已更新到 ${remote_ver}，请重新运行 ${SBP_SCRIPT_PATH} 以使用新版本。"
+  fi
+  return "$rc"
+}
+
 usage(){
   cat <<EOF
 用法：
@@ -3861,10 +3822,17 @@ usage(){
                                  更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)
   sudo bash sbp.sh --update-runtime
                                  轻量更新管理脚本与 DNS 运行时组件
+  sudo bash sbp.sh --update-script
+                                 从 GitHub 拉取最新管理脚本并应用轻量更新
   sudo bash sbp.sh --uninstall   彻底卸载 Sing-Box-Plus
   bash sbp.sh --help             显示本帮助
 
 轻量更新不会改写节点配置、凭证或端口，也不会主动重启 sing-box。
+
+--update-script 可用以下环境变量覆盖来源与行为：
+  SBP_REPO=用户名/仓库名   （默认 ${SBP_REPO}）
+  SBP_BRANCH=分支名        （默认 ${SBP_BRANCH}）
+  SBP_FORCE_UPDATE=1       版本号相同时也强制覆盖
 EOF
 }
 
@@ -3918,8 +3886,9 @@ menu(){
     8) enable_bbr; read -rp "回车返回..." _ || true; menu ;;
     9) update_singbox; read -rp "回车返回..." _ || true; menu ;;
     10) update_geofiles; read -rp "回车返回..." _ || true; menu ;;
-    11) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
-    12) uninstall_all ;;
+    11) update_script_from_remote; read -rp "回车返回..." _ || true; menu ;;
+    12) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
+    13) uninstall_all ;;
     0|q|Q) exit 0 ;;
     *) echo -e "${C_YELLOW}无效选项，请重新选择${C_RESET}"; sleep 1; menu ;;
   esac
@@ -3933,6 +3902,7 @@ main(){
     --update-core) update_singbox ;;
     --update-geofiles) update_geofiles ;;
     --update-runtime) update_runtime_components ;;
+    --update-script) update_script_from_remote ;;
     --uninstall) uninstall_all ;;
     -h|--help) usage ;;
     *)

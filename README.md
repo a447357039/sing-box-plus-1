@@ -51,7 +51,29 @@ curl -fsSL -o sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/m
 
 ## ♻️ 已有服务器轻量更新
 
-已部署节点的服务器可以只更新管理脚本、DNS 健康检查辅助脚本和定时器配置：
+已部署节点的服务器可以只更新管理脚本、DNS 健康检查辅助脚本和定时器配置。
+
+### 一键更新（推荐）
+
+已装过本脚本的机器，直接用管理脚本自己拉取最新版：
+
+```bash
+sudo /root/sbp.sh --update-script
+```
+
+也可以在管理菜单里选 `11) 从 GitHub 更新管理脚本`。
+
+它会下载最新脚本、校验语法与内容完整性（拒绝 404 页面等异常响应），
+比对版本号，再走下面的轻量更新流程应用。版本号相同时会跳过，
+需要强制覆盖时加 `SBP_FORCE_UPDATE=1`。默认源可用环境变量覆盖：
+
+```bash
+sudo SBP_REPO=yayitinyu/sing-box-plus SBP_BRANCH=main /root/sbp.sh --update-script
+```
+
+首次部署、或 `/root/sbp.sh` 已损坏无法执行时，用下面的手动方式。
+
+### 手动更新
 
 ```bash
 curl -fsSL \
@@ -61,9 +83,10 @@ bash -n /tmp/sbp.sh
 sudo bash /tmp/sbp.sh --update-runtime
 ```
 
-该命令会把当前脚本安装到 `/root/sbp.sh`，并将更新前的文件备份到
+以上两种方式都会把脚本安装到 `/root/sbp.sh`，并将更新前的文件备份到
 `/opt/sing-box/backups/runtime-update-*`。它不会改写 `config.json`、节点凭证或端口，
 也不会主动重启 `sing-box.service`；DNS 定时器原本未运行时会保持不运行。
+若更新中途失败，会自动回滚到备份状态。
 
 以后可直接运行 `/root/sbp.sh` 打开管理菜单。若要覆盖防抖默认值，可在更新时传入：
 
@@ -78,7 +101,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.0.0 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.1.0 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
   服务状态: 运行中 (Active)  |  核心版本: sing-box v1.12.7
@@ -99,8 +122,9 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
   【核心与规则维护】
     9) 更新 sing-box 核心版本
    10) 更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)
-   11) 一键系统网络诊断
-   12) 彻底卸载 Sing-Box-Plus
+   11) 从 GitHub 更新管理脚本
+   12) 一键系统网络诊断
+   13) 彻底卸载 Sing-Box-Plus
 
     0) 退出管理脚本
 =============================================================
@@ -155,11 +179,12 @@ Reality SNI 可独立修改。脚本会同时更新服务端握手目标和 VLES
 
 ### 自定义路由与默认出口
 
-菜单 `7) 自定义路由与分流规则` 支持按目标网站指定出口分流、切换非 Warp 协议节点的默认出口 IP，以及为出口节点配置 V4 / V6 / 双栈解析策略：
+菜单 `7) 自定义路由与分流规则` 支持按目标网站指定出口分流，以及切换非 Warp 协议节点的默认出口 IP：
 
 - **非 Warp 节点默认出口**：支持将 10 个直连协议节点（VLESS-Reality、Hysteria2、TUIC 等）的默认出口 IP 自由切换为已导入的其他 VPS 节点、本机双栈（`direct`）、本机 IPv4（`direct-ipv4`）、本机 IPv6（`direct-ipv6`）或 WARP。
-- **出口节点 IP 栈策略**：支持为任意导入的出口节点指定 **双栈（优先 IPv4）**、**仅 IPv4（ipv4_only）**、**仅 IPv6（ipv6_only）** 或 **双栈（优先 IPv6）** 策略。
 - **自定义分流规则**：支持为特定域名或 geosite 指定专属出口。
+
+> 本机 IPv4 / IPv6 出口通过绑定本机源地址实现。仅 IPv6 出口无法访问没有 AAAA 记录的站点；客户端直接以 IP 地址（而非域名）发起的连接不受解析策略约束。导入的远程节点走哪个 IP 栈出口由对端节点决定，本机无法配置。
 
 | 出口类型 | 用途示例 |
 |----------|----------|
@@ -167,7 +192,7 @@ Reality SNI 可独立修改。脚本会同时更新服务端握手目标和 VLES
 | 本机双栈直连 | 默认双栈出口，支持 IPv4 + IPv6 |
 | 本机 IPv4 | `suffix:openai.com` 固定走 IPv4 出口 |
 | 本机 IPv6 | 需要原生 IPv6 的场景 |
-| 远程 VPS 节点 | 粘贴分享链接（VLESS / Trojan / Hy2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）或 sing-box outbound JSON 导入，可配置 V4/V6/双栈策略，并可作为分流出口或设为非 Warp 节点默认出口 |
+| 远程 VPS 节点 | 粘贴分享链接（VLESS / Trojan / Hy2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）或 sing-box outbound JSON 导入，可作为分流出口或设为非 Warp 节点默认出口 |
 
 匹配项支持逗号或空格分隔，支持以下格式：
 
@@ -228,6 +253,9 @@ DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sb
 | `SBP_SKIP_DEPS` | `0` | 设为 `1` 跳过启动时依赖检查 |
 | `SBP_BIN_ONLY` | `0` | 设为 `1` 强制走二进制下载 |
 | `SBP_SOFT` | `0` | 设为 `1` 宽松模式（依赖安装失败时继续） |
+| `SBP_REPO` | `yayitinyu/sing-box-plus` | `--update-script` 拉取脚本的 GitHub 仓库 |
+| `SBP_BRANCH` | `main` | `--update-script` 拉取脚本的分支 |
+| `SBP_FORCE_UPDATE` | `0` | 设为 `1` 时版本号相同也强制覆盖更新 |
 | `TCP_KEEP_ALIVE` | `30s` | TCP 保活时间 |
 | `TCP_KEEP_ALIVE_INTERVAL` | `30s` | TCP 保活探测间隔 |
 | `UDP_TIMEOUT` | `10m` | UDP NAT 过期时间 |

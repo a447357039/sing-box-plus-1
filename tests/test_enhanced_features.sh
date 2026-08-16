@@ -216,14 +216,9 @@ jq '.default_outbound = "direct-ipv6" | .rules = [{outbound:"direct-ipv6",domain
 assert_equal "0" "$(jq '(.rules // []) | length' "$ROUTE_JSON")" "rules must be cleared"
 assert_equal "direct-ipv6" "$(jq -r '.default_outbound' "$ROUTE_JSON")" "clear_custom_route_rules must preserve default_outbound"
 
-# 7. 测试 set_outbound_ip_strategy (V4 / V6 / 双栈切换)
+# 7. 测试导入出口的 legacy domain_strategy 归一化
 jq --argjson ob "$out_socks5" '.outbounds += [($ob + {tag: "node-strat", domain_strategy: "prefer_ipv4"})]' "$ROUTE_JSON" > "$ROUTE_JSON.tmp" && mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
-
-# 切换为仅 IPv4
-(printf '%s\n' "1" "2" | set_outbound_ip_strategy) > "$test_root/strat_v4.log" 2>&1 || true
-assert_equal "ipv4_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$ROUTE_JSON")" "strategy must be ipv4_only"
 write_config
-assert_equal "ipv4_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$CONF_JSON")" "config.json must reflect ipv4_only resolver strategy"
 assert_equal "null" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | .domain_strategy // "null"' "$CONF_JSON")" "config.json must not have deprecated domain_strategy"
 assert_equal "null" "$(jq -r '.outbounds[] | select(.tag == "direct") | .domain_strategy // "null"' "$CONF_JSON")" "direct outbound must not have deprecated domain_strategy"
 
@@ -231,13 +226,14 @@ assert_equal "null" "$(jq -r '.outbounds[] | select(.tag == "direct") | .domain_
 print_custom_routes > "$test_root/print_routes.log" 2>&1
 assert_equal "0" "$?" "print_custom_routes must execute cleanly without jq errors"
 
-# 切换为仅 IPv6
-(printf '%s\n' "1" "3" | set_outbound_ip_strategy) > "$test_root/strat_v6.log" 2>&1 || true
-assert_equal "ipv6_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$ROUTE_JSON")" "strategy must be ipv6_only"
+# 回归：default_outbound 键缺失时，选择 direct 必须落盘而不是被当成“未发生变化”
+jq 'del(.default_outbound)' "$ROUTE_JSON" > "$ROUTE_JSON.tmp" && mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
+(echo "1" | set_custom_default_outbound) > "$test_root/default_direct.log" 2>&1 || true
+assert_equal "direct" "$(jq -r '.default_outbound // "missing"' "$ROUTE_JSON")" "missing default_outbound must be persisted when direct is selected"
 
-# 切换为双栈优先 IPv4
-(printf '%s\n' "1" "1" | set_outbound_ip_strategy) > "$test_root/strat_dual.log" 2>&1 || true
-assert_equal "dns-doh-primary" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | .domain_resolver' "$ROUTE_JSON")" "strategy must be dual-stack primary"
+# 键已存在且值相同时应视为未变化，不重复写入
+(echo "1" | set_custom_default_outbound) > "$test_root/default_noop.log" 2>&1 || true
+assert_equal "direct" "$(jq -r '.default_outbound' "$ROUTE_JSON")" "selecting the current outbound again must keep it unchanged"
 
 # 8. 测试 uninstall_all 交互取消与确认
 (echo "n" | uninstall_all) > "$test_root/uninstall_cancel.log" 2>&1 || true
