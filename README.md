@@ -155,17 +155,19 @@ Reality SNI 可独立修改。脚本会同时更新服务端握手目标和 VLES
 
 ### 自定义路由与默认出口
 
-菜单 `7) 自定义路由与分流规则` 支持按目标网站指定出口分流，以及切换非 Warp 协议节点的默认出口 IP：
+菜单 `7) 自定义路由与分流规则` 支持按目标网站指定出口分流、切换非 Warp 协议节点的默认出口 IP，以及为出口节点配置 V4 / V6 / 双栈解析策略：
 
-- **非 Warp 节点默认出口**：支持将 10 个直连协议节点（VLESS-Reality、Hysteria2、TUIC 等）的默认出口 IP 切换为已导入的其他 VPS 节点、本机 IPv4、本机 IPv6 或 WARP。
+- **非 Warp 节点默认出口**：支持将 10 个直连协议节点（VLESS-Reality、Hysteria2、TUIC 等）的默认出口 IP 自由切换为已导入的其他 VPS 节点、本机双栈（`direct`）、本机 IPv4（`direct-ipv4`）、本机 IPv6（`direct-ipv6`）或 WARP。
+- **出口节点 IP 栈策略**：支持为任意导入的出口节点指定 **双栈（优先 IPv4）**、**仅 IPv4（ipv4_only）**、**仅 IPv6（ipv6_only）** 或 **双栈（优先 IPv6）** 策略。
 - **自定义分流规则**：支持为特定域名或 geosite 指定专属出口。
 
 | 出口类型 | 用途示例 |
 |----------|----------|
 | 本机 WARP | `geosite:netflix` 走 WARP 解锁流媒体 |
+| 本机双栈直连 | 默认双栈出口，支持 IPv4 + IPv6 |
 | 本机 IPv4 | `suffix:openai.com` 固定走 IPv4 出口 |
 | 本机 IPv6 | 需要原生 IPv6 的场景 |
-| 远程 VPS 节点 | 粘贴分享链接（VLESS / Trojan / Hy2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）或 sing-box outbound JSON 导入，可作为分流出口或设为非 Warp 节点默认出口 |
+| 远程 VPS 节点 | 粘贴分享链接（VLESS / Trojan / Hy2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）或 sing-box outbound JSON 导入，可配置 V4/V6/双栈策略，并可作为分流出口或设为非 Warp 节点默认出口 |
 
 匹配项支持逗号或空格分隔，支持以下格式：
 

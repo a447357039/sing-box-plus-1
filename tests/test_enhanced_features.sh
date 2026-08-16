@@ -216,7 +216,24 @@ jq '.default_outbound = "direct-ipv6" | .rules = [{outbound:"direct-ipv6",domain
 assert_equal "0" "$(jq '(.rules // []) | length' "$ROUTE_JSON")" "rules must be cleared"
 assert_equal "direct-ipv6" "$(jq -r '.default_outbound' "$ROUTE_JSON")" "clear_custom_route_rules must preserve default_outbound"
 
-# 7. 测试 uninstall_all 交互取消与确认
+# 7. 测试 set_outbound_ip_strategy (V4 / V6 / 双栈切换)
+jq --argjson ob "$out_socks5" '.outbounds += [($ob + {tag: "node-strat"})]' "$ROUTE_JSON" > "$ROUTE_JSON.tmp" && mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
+
+# 切换为仅 IPv4
+(printf '%s\n' "1" "2" | set_outbound_ip_strategy) > "$test_root/strat_v4.log" 2>&1 || true
+assert_equal "ipv4_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$ROUTE_JSON")" "strategy must be ipv4_only"
+write_config
+assert_equal "ipv4_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$CONF_JSON")" "config.json must reflect ipv4_only"
+
+# 切换为仅 IPv6
+(printf '%s\n' "1" "3" | set_outbound_ip_strategy) > "$test_root/strat_v6.log" 2>&1 || true
+assert_equal "ipv6_only" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | (.domain_resolver | objects | .strategy) // ""' "$ROUTE_JSON")" "strategy must be ipv6_only"
+
+# 切换为双栈优先 IPv4
+(printf '%s\n' "1" "1" | set_outbound_ip_strategy) > "$test_root/strat_dual.log" 2>&1 || true
+assert_equal "dns-doh-primary" "$(jq -r '.outbounds[] | select(.tag == "node-strat") | .domain_resolver' "$ROUTE_JSON")" "strategy must be dual-stack primary"
+
+# 8. 测试 uninstall_all 交互取消与确认
 (echo "n" | uninstall_all) > "$test_root/uninstall_cancel.log" 2>&1 || true
 if [[ ! -d "$SB_DIR" ]]; then
   echo "FAIL: canceling uninstall must keep $SB_DIR intact" >&2

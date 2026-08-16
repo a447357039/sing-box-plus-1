@@ -1965,7 +1965,9 @@ if ! jq --arg dns "$selected" '
   | .outbounds = ((.outbounds // []) | map(
       if .tag == "direct-ipv4" then .domain_resolver = {server:$dns, strategy:"ipv4_only"}
       elif .tag == "direct-ipv6" then .domain_resolver = {server:$dns, strategy:"ipv6_only"}
+      elif (.domain_resolver | type == "object" and .domain_resolver.strategy != null) then .domain_resolver.server = $dns
       elif .type == "direct" then .domain_resolver = $dns
+      elif (.domain_resolver | type == "string") then .domain_resolver = $dns
       else . end
     ))
   | .endpoints = ((.endpoints // []) | map(if .tag == "warp" then .domain_resolver = $dns else . end))
@@ -2431,6 +2433,12 @@ print_custom_routes(){
        (.domain_keyword // [] | map("keyword:" + .))[],
        (.domain_regex // [] | map("regex:" + .))[],
        (.rule_set // [] | map("rule-set:" + .))[]] | join(", ");
+    def ip_strat:
+      ((.domain_resolver | objects | .strategy) // "") as $st
+      | if $st == "ipv4_only" then "仅 IPv4"
+        elif $st == "ipv6_only" then "仅 IPv6"
+        elif $st == "prefer_ipv6" then "双栈 (优先 IPv6)"
+        else "双栈" end;
     "自定义路由规则:",
     (if ((.rules // []) | length) == 0 then
       "  （无）"
@@ -2442,7 +2450,7 @@ print_custom_routes(){
     (if ((.outbounds // []) | length) == 0 then
       "  （无）"
     else
-      (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)]" + (if .value.tag == $def then " (当前默认出口)" else "" end))
+      (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)] [\(.value | ip_strat)]" + (if .value.tag == $def then " (当前默认出口)" else "" end))
     end)
   ' "$ROUTE_JSON"
 }
@@ -2453,18 +2461,29 @@ select_route_outbound(){
   SBP_SELECTED_OUTBOUND=""
   ip4="$(default_ipv4_address || true)"
   ip6="$(default_ipv6_address || true)"
-  mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$ROUTE_JSON")
+  mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$ROUTE_JSON" | tr -d '\r')
 
-  echo "选择这条规则使用的出口："
-  echo "  1) 本机 WARP（warp）"
-  echo "  2) 本机 IPv4（direct-ipv4，当前 ${ip4:-未检测到}）"
-  echo "  3) 本机 IPv6（direct-ipv6，当前 ${ip6:-未检测到}）"
-  idx=4
+  echo "选择这条规则使用的出口（支持 V4 / V6 / 双栈 / 远程节点）："
+  echo "  1) 本机 WARP 出口（warp：Cloudflare WARP 双栈）"
+  echo "  2) 本机双栈出口（direct：IPv4 + IPv6 双栈直连，当前 IPv4=${ip4:-未检测到} IPv6=${ip6:-未检测到}）"
+  echo "  3) 本机 IPv4 出口（direct-ipv4：仅 IPv4 直连，当前 ${ip4:-未检测到}）"
+  echo "  4) 本机 IPv6 出口（direct-ipv6：仅 IPv6 直连，当前 ${ip6:-未检测到}）"
+  idx=5
   for tag in "${imported[@]}"; do
-    echo "  ${idx}) 导入出口：${tag}"
+    local cur_strat
+    cur_strat="$(jq -r --arg tag "$tag" '
+      .outbounds[] | select(.tag == $tag) |
+      ((.domain_resolver | objects | .strategy) // "") as $st |
+      if $st == "ipv4_only" then "仅 IPv4"
+      elif $st == "ipv6_only" then "仅 IPv6"
+      elif $st == "prefer_ipv6" then "双栈 (优先 IPv6)"
+      else "双栈" end
+    ' "$ROUTE_JSON" 2>/dev/null || echo "双栈")"
+    echo "  ${idx}) 导入出口：${tag} [${cur_strat}]"
     idx=$((idx+1))
   done
   read -rp "选择出口: " choice || return 1
+  choice="${choice//$'\r'/}"
   case "$choice" in
     1)
       if ! load_warp >/dev/null 2>&1; then
@@ -2473,16 +2492,19 @@ select_route_outbound(){
       SBP_SELECTED_OUTBOUND="warp"
       ;;
     2)
+      SBP_SELECTED_OUTBOUND="direct"
+      ;;
+    3)
       [[ -n "$ip4" ]] || warn "未检测到本机 IPv4，规则仍会使用 ipv4_only 解析策略。"
       SBP_SELECTED_OUTBOUND="direct-ipv4"
       ;;
-    3)
+    4)
       [[ -n "$ip6" ]] || warn "未检测到本机 IPv6，规则仍会使用 ipv6_only 解析策略。"
       SBP_SELECTED_OUTBOUND="direct-ipv6"
       ;;
     *)
       if [[ "$choice" =~ ^[0-9]+$ ]]; then
-        idx=$((choice-4))
+        idx=$((choice-5))
         if (( idx >= 0 && idx < ${#imported[@]} )); then
           SBP_SELECTED_OUTBOUND="${imported[$idx]}"
         fi
@@ -2501,6 +2523,7 @@ add_custom_route_rule(){
   echo "简写：netflix 会按 geosite 处理；example.com 会按域名后缀处理。"
   local matches name match_json route_bak tmp
   read -rp "匹配项: " matches || return 1
+  matches="${matches//$'\r'/}"
   match_json="$(parse_route_match_json "$matches")"
   if ! printf '%s' "$match_json" | jq -e '
     (((.domain // []) | length)
@@ -2513,6 +2536,7 @@ add_custom_route_rule(){
     return 1
   fi
   read -rp "规则名称（可留空）: " name || true
+  name="${name//$'\r'/}"
 
   route_bak="$(mktemp)"
   cp "$ROUTE_JSON" "$route_bak"
@@ -2538,6 +2562,7 @@ import_custom_route_outbound(){
   ensure_route_file
   local tag raw outbound src_tag route_bak tmp
   read -rp "给这个远程出口起一个 tag（例如 hk-vps）: " tag || return 1
+  tag="${tag//$'\r'/}"
   if ! valid_route_tag "$tag"; then
     warn "tag 只能包含字母、数字、点、下划线、短横线、@、!。"
     return 1
@@ -2550,17 +2575,20 @@ import_custom_route_outbound(){
   esac
   if jq -e --arg tag "$tag" 'any(.outbounds[]?; .tag == $tag)' "$ROUTE_JSON" >/dev/null; then
     read -rp "已存在同名出口，是否覆盖？[y/N] " yn || return 1
+    yn="${yn//$'\r'/}"
     [[ "$yn" =~ ^[Yy]$ ]] || return 1
   fi
 
   echo "粘贴分享链接（支持 VLESS / Trojan / Hysteria2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）、sing-box outbound JSON，或输入包含 sing-box 配置的文件路径。"
   read -r -p "节点配置: " raw || return 1
+  raw="${raw//$'\r'/}"
   [[ -f "$raw" ]] && raw="$(cat "$raw")"
 
   if printf '%s' "$raw" | jq -e 'type == "object" and ((.outbounds // empty) | type == "array")' >/dev/null 2>&1; then
     echo "文件内可用 outbounds："
     printf '%s' "$raw" | jq -r '.outbounds[]?.tag' | sed 's/^/  - /'
     read -rp "选择要导入的源 tag: " src_tag || return 1
+    src_tag="${src_tag//$'\r'/}"
     outbound="$(printf '%s' "$raw" | jq -c --arg src "$src_tag" --arg tag "$tag" '
       .outbounds[] | select(.tag == $src) | .tag = $tag
       | if (has("server") and (has("domain_resolver") | not)) then .domain_resolver = "dns-doh-primary" else . end
@@ -2604,25 +2632,34 @@ set_custom_default_outbound(){
   current_outbound="$(jq -r '.default_outbound // "direct"' "$ROUTE_JSON" 2>/dev/null || echo "direct")"
   ip4="$(default_ipv4_address || true)"
   ip6="$(default_ipv6_address || true)"
-  mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$ROUTE_JSON")
+  mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$ROUTE_JSON" | tr -d '\r')
 
   echo -e "当前非 Warp 节点出口: ${C_GREEN}${current_outbound}${C_RESET}"
-  echo "请选择要作为非 Warp 节点默认出口的目标："
-  echo "  1) 本机直连（direct，默认）"
-  echo "  2) 本机 IPv4（direct-ipv4，当前 ${ip4:-未检测到}）"
-  echo "  3) 本机 IPv6（direct-ipv6，当前 ${ip6:-未检测到}）"
-  echo "  4) 本机 WARP（warp）"
+  echo "请选择要作为非 Warp 节点默认出口的目标（支持 V4 / V6 / 双栈 / 远程节点）："
+  echo "  1) 本机双栈出口（direct：IPv4 + IPv6 双栈，当前 IPv4=${ip4:-未检测到} IPv6=${ip6:-未检测到}）"
+  echo "  2) 本机 IPv4 出口（direct-ipv4：仅 IPv4，当前 ${ip4:-未检测到}）"
+  echo "  3) 本机 IPv6 出口（direct-ipv6：仅 IPv6，当前 ${ip6:-未检测到}）"
+  echo "  4) 本机 WARP 出口（warp：Cloudflare WARP 双栈）"
   idx=5
   for tag in "${imported[@]}"; do
+    local cur_strat
+    cur_strat="$(jq -r --arg tag "$tag" '
+      .outbounds[] | select(.tag == $tag) |
+      ((.domain_resolver | objects | .strategy) // "") as $st |
+      if $st == "ipv4_only" then "仅 IPv4"
+      elif $st == "ipv6_only" then "仅 IPv6"
+      elif $st == "prefer_ipv6" then "双栈 (优先 IPv6)"
+      else "双栈" end
+    ' "$ROUTE_JSON" 2>/dev/null || echo "双栈")"
     if [[ "$tag" == "$current_outbound" ]]; then
-      echo "  ${idx}) 导入出口：${tag} (当前选中)"
+      echo "  ${idx}) 导入出口：${tag} [${cur_strat}] (当前选中)"
     else
-      echo "  ${idx}) 导入出口：${tag}"
+      echo "  ${idx}) 导入出口：${tag} [${cur_strat}]"
     fi
     idx=$((idx+1))
   done
   read -rp "选择出口 [当前: ${current_outbound}]: " choice || return 1
-  choice="${choice:-}"
+  choice="${choice//$'\r'/}"
   [[ -z "$choice" ]] && { info "未更改出口设置"; return 0; }
 
   case "$choice" in
@@ -2673,6 +2710,90 @@ set_custom_default_outbound(){
     rm -f "$tmp"
     cp "$route_bak" "$ROUTE_JSON"
     warn "保存出口配置失败。"
+  fi
+  rm -f "$route_bak"
+}
+
+set_outbound_ip_strategy(){
+  ensure_route_file
+  local -a imported
+  mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$ROUTE_JSON" | tr -d '\r')
+  if (( ${#imported[@]} == 0 )); then
+    warn "暂无导入的远程出口节点，请先导入节点。"
+    return 0
+  fi
+
+  echo "请选择要配置 IP 栈策略的出口节点："
+  local idx=1 tag choice strat strat_label route_bak tmp
+  for tag in "${imported[@]}"; do
+    local cur_strat
+    cur_strat="$(jq -r --arg tag "$tag" '
+      .outbounds[] | select(.tag == $tag) |
+      ((.domain_resolver | objects | .strategy) // "") as $st |
+      if $st == "ipv4_only" then "仅 IPv4"
+      elif $st == "ipv6_only" then "仅 IPv6"
+      elif $st == "prefer_ipv6" then "双栈 (优先 IPv6)"
+      else "双栈" end
+    ' "$ROUTE_JSON" 2>/dev/null || echo "双栈")"
+    echo "  ${idx}) ${tag} [当前: ${cur_strat}]"
+    idx=$((idx+1))
+  done
+  read -rp "选择节点编号: " choice || return 1
+  choice="${choice//$'\r'/}"
+  [[ "$choice" =~ ^[0-9]+$ ]] || { warn "编号无效"; return 1; }
+  idx=$((choice-1))
+  if (( idx < 0 || idx >= ${#imported[@]} )); then
+    warn "选择超出范围"; return 1
+  fi
+  tag="${imported[$idx]}"
+
+  echo
+  echo "为 [${tag}] 选择 IP 栈出口策略："
+  echo "  1) 双栈（默认，优先 IPv4）"
+  echo "  2) 仅 IPv4 出口（ipv4_only）"
+  echo "  3) 仅 IPv6 出口（ipv6_only）"
+  echo "  4) 双栈（优先 IPv6，prefer_ipv6）"
+  read -rp "选择策略 [1-4]: " strat || return 1
+  strat="${strat//$'\r'/}"
+
+  local dns_obj
+  case "$strat" in
+    1)
+      dns_obj='"dns-doh-primary"'
+      strat_label="双栈 (优先 IPv4)"
+      ;;
+    2)
+      dns_obj='{"server":"dns-doh-primary","strategy":"ipv4_only"}'
+      strat_label="仅 IPv4"
+      ;;
+    3)
+      dns_obj='{"server":"dns-doh-primary","strategy":"ipv6_only"}'
+      strat_label="仅 IPv6"
+      ;;
+    4)
+      dns_obj='{"server":"dns-doh-primary","strategy":"prefer_ipv6"}'
+      strat_label="双栈 (优先 IPv6)"
+      ;;
+    *)
+      warn "无效策略选择"
+      return 1
+      ;;
+  esac
+
+  route_bak="$(mktemp)"
+  cp "$ROUTE_JSON" "$route_bak"
+  tmp="$(mktemp)"
+  if jq -c --arg tag "$tag" --argjson dns "$dns_obj" '
+    .outbounds = ((.outbounds // []) | map(if .tag == $tag then .domain_resolver = $dns else . end))
+  ' "$ROUTE_JSON" > "$tmp"; then
+    mv "$tmp" "$ROUTE_JSON"
+    if apply_custom_routing "$route_bak"; then
+      info "节点 [${tag}] IP 栈策略已更新为：${strat_label}"
+    fi
+  else
+    rm -f "$tmp"
+    cp "$route_bak" "$ROUTE_JSON"
+    warn "保存 IP 栈策略失败。"
   fi
   rm -f "$route_bak"
 }
@@ -2768,10 +2889,11 @@ custom_route_menu(){
     hr
     echo -e "  ${C_GREEN}1)${C_RESET} 添加网址 / geosite 路由规则"
     echo -e "  ${C_GREEN}2)${C_RESET} 导入其他 VPS 出口节点"
-    echo -e "  ${C_GREEN}3)${C_RESET} 设置非 Warp 节点默认出口 IP"
-    echo -e "  ${C_YELLOW}4)${C_RESET} 删除路由规则"
-    echo -e "  ${C_YELLOW}5)${C_RESET} 删除导入出口"
-    echo -e "  ${C_RED}6)${C_RESET} 清空自定义路由规则"
+    echo -e "  ${C_GREEN}3)${C_RESET} 设置非 Warp 节点默认出口 (V4 / V6 / 双栈 / 导入节点)"
+    echo -e "  ${C_GREEN}4)${C_RESET} 设置出口节点 IP 栈策略 (双栈 / 仅 IPv4 / 仅 IPv6)"
+    echo -e "  ${C_YELLOW}5)${C_RESET} 删除路由规则"
+    echo -e "  ${C_YELLOW}6)${C_RESET} 删除导入出口"
+    echo -e "  ${C_RED}7)${C_RESET} 清空自定义路由规则"
     echo -e "  ${C_RED}0)${C_RESET} 返回主菜单"
     hr
     read -rp "选择: " op || return 0
@@ -2779,9 +2901,10 @@ custom_route_menu(){
       1) add_custom_route_rule; read -rp "回车继续..." _ || true ;;
       2) import_custom_route_outbound; read -rp "回车继续..." _ || true ;;
       3) set_custom_default_outbound; read -rp "回车继续..." _ || true ;;
-      4) remove_custom_route_rule; read -rp "回车继续..." _ || true ;;
-      5) remove_custom_route_outbound; read -rp "回车继续..." _ || true ;;
-      6) clear_custom_route_rules; read -rp "回车继续..." _ || true ;;
+      4) set_outbound_ip_strategy; read -rp "回车继续..." _ || true ;;
+      5) remove_custom_route_rule; read -rp "回车继续..." _ || true ;;
+      6) remove_custom_route_outbound; read -rp "回车继续..." _ || true ;;
+      7) clear_custom_route_rules; read -rp "回车继续..." _ || true ;;
       0|q|Q) return 0 ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
