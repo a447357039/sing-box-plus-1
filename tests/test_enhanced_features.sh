@@ -30,8 +30,29 @@ export ROUTE_JSON="$test_root/state/routes.json"
 export SHARE_LINKS_FILE="$test_root/state/share-links.txt"
 export BIN_PATH="$test_root/bin/sing-box"
 export SYSTEMD_SERVICE="test-sing-box.service"
+# 本套件会调用 uninstall_all，以下路径若不重定向就会删掉真实部署的组件
+export DNS_HEALTH_BIN="$test_root/bin/dns-health"
+export EVENT_LOG_BIN="$test_root/bin/event-log"
+export WGCF_BIN="$test_root/bin/wgcf"
+export SYSTEMD_UNIT_DIR="$test_root/systemd"
+export DNS_HEALTH_SERVICE="test-dns-health.service"
+export DNS_HEALTH_TIMER="test-dns-health.timer"
 
-mkdir -p "$SBP_BIN_DIR" "$SB_DIR" "$DATA_DIR" "$CERT_DIR"
+# uninstall_all 还会删除若干硬编码路径（/var/lib/sing-box、/usr/local/bin/sbp、
+# /tmp/sing-box*、/tmp/sbp*），这些无法通过环境变量重定向，因此在检测到真实
+# 部署时拒绝运行。确认机器可牺牲时用 SBP_ALLOW_DESTRUCTIVE_TEST=1 显式放行。
+if [[ "${SBP_ALLOW_DESTRUCTIVE_TEST:-0}" != "1" ]]; then
+  for probe in /opt/sing-box /usr/local/sbin/sing-box-plus-event /var/lib/sing-box; do
+    if [[ -e "$probe" ]]; then
+      echo "REFUSING: detected a real sing-box-plus install at $probe" >&2
+      echo "This suite calls uninstall_all and removes hardcoded paths it cannot sandbox." >&2
+      echo "Run it on a throwaway machine, or set SBP_ALLOW_DESTRUCTIVE_TEST=1 to override." >&2
+      exit 1
+    fi
+  done
+fi
+
+mkdir -p "$SBP_BIN_DIR" "$SB_DIR" "$DATA_DIR" "$CERT_DIR" "$SYSTEMD_UNIT_DIR"
 
 # shellcheck source=../sing-box-plus.sh
 source "$main_script"

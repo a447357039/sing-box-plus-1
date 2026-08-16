@@ -101,7 +101,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.1.1 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.1.2 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
   服务状态: 运行中 (Active)  |  核心版本: sing-box v1.12.7
@@ -161,6 +161,23 @@ Reality SNI 可独立修改。脚本会同时更新服务端握手目标和 VLES
 已部署时，修改域名、证书或 SNI 后，脚本会先校验新配置，再重启正在运行的服务并刷新 `/opt/sing-box/share-links.txt`。生成或重启失败时会恢复原配置和托管证书。
 
 > 手动证书或 ACME 模式下，TLS 节点的地址和 SNI 始终使用证书域名。脚本不会再因证书异常自动降级到“允许不安全连接”。
+
+### 重新签发自签证书
+
+轻量更新（`--update-script` / `--update-runtime`）**不会重签证书**——它按设计不改写 `config.json`、也不重启服务。若曾修改过 Reality SNI，自签证书可能仍停留在旧域名。更新后如检测到不匹配，脚本会给出提示，可用：
+
+```bash
+sudo /root/sbp.sh --reissue-cert
+```
+
+或在菜单 `6) 域名、证书与 SNI 设置` 里选 `3) 重新签发自签证书`。该命令会重签、校验配置并重启 sing-box，失败时自动恢复原证书。仅对自签模式有效；手动 / ACME 证书不由脚本签发。
+
+手动确认某台机器是否受影响：
+
+```bash
+grep ^REALITY_SERVER= /opt/sing-box/env.conf
+openssl x509 -in /opt/sing-box/cert/fullchain.pem -noout -subject
+```
 
 ---
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v3.1.1
+#  Version: v3.1.2
 # ============================================================
 
 set -Eeuo pipefail
@@ -330,7 +330,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.1.1"
+SCRIPT_VERSION="v3.1.2"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -1326,6 +1326,68 @@ prepare_tls_certificate(){
   esac
 }
 
+# 仅自签模式的证书由脚本托管；手动 / ACME 证书由用户或 CA 签发，重签无意义
+managed_cert_sni_mismatch(){
+  [[ "${TLS_CERT_MODE:-self_signed}" == "self_signed" ]] || return 1
+  [[ -n "${REALITY_SERVER:-}" ]] || return 1
+  local crt="${CERT_DIR}/fullchain.pem"
+  # 尚未部署过证书时不算不匹配，避免全新机器上误报
+  [[ -s "$crt" ]] || return 1
+  ! cert_matches_host "$crt" "$REALITY_SERVER"
+}
+
+warn_if_cert_sni_mismatch(){
+  managed_cert_sni_mismatch || return 0
+  warn "托管自签证书与当前 Reality SNI (${REALITY_SERVER}) 不匹配，证书仍是旧域名。"
+  warn "运行 sudo ${SBP_SCRIPT_PATH} --reissue-cert 重新签发（会重启 sing-box）。"
+}
+
+reissue_managed_certificate(){
+  [[ "$EUID" -eq 0 || "${SBP_SKIP_ROOT:-0}" -eq 1 || -n "${TEST_ROOT:-}" ]] \
+    || die "重新签发证书需要 root 权限，请使用 sudo 运行"
+  load_env || true
+  apply_runtime_overrides
+  normalize_runtime_settings
+
+  if [[ "${TLS_CERT_MODE:-self_signed}" != "self_signed" ]]; then
+    info "当前证书模式为 $(tls_mode_label)，证书不由脚本签发，无需重签。"
+    return 0
+  fi
+
+  local backup rc=0
+  backup="$(mktemp -d)" || die "无法创建证书备份目录"
+  mkdir -p "$CERT_DIR"
+  cp -a "$CERT_DIR/." "$backup/" 2>/dev/null || true
+
+  local failure=""
+  if ! prepare_tls_certificate; then
+    failure="重新签发自签证书失败"
+  elif ! cert_matches_host "$TLS_CERT_PATH" "$REALITY_SERVER"; then
+    failure="新证书仍不匹配 SNI ${REALITY_SERVER}"
+  elif [[ -x "$BIN_PATH" && -s "$CONF_JSON" ]] && ! "$BIN_PATH" check -c "$CONF_JSON"; then
+    failure="配置检查失败"
+  fi
+  if [[ -n "$failure" ]]; then
+    cp -a "$backup/." "$CERT_DIR/" 2>/dev/null || true
+    rm -rf "$backup"
+    die "${failure}，已恢复原证书"
+  fi
+
+  info "自签证书已重新签发：CN=${REALITY_SERVER}"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
+    if systemctl restart "$SYSTEMD_SERVICE"; then
+      info "sing-box 已重启，新证书生效。"
+    else
+      warn "证书已更新，但服务重启失败，请手动检查。"
+      rc=1
+    fi
+  else
+    info "sing-box 未在运行，证书已更新，下次启动时生效。"
+  fi
+  rm -rf "$backup"
+  return "$rc"
+}
+
 tls_uses_public_certificate(){
   case "$TLS_CERT_MODE" in
     acme) valid_tls_domain "$TLS_DOMAIN" ;;
@@ -1354,7 +1416,7 @@ ensure_creds(){
 }
 
 # ===== WARP（wgcf） =====
-WGCF_BIN=/usr/local/bin/wgcf
+WGCF_BIN=${WGCF_BIN:-/usr/local/bin/wgcf}
 install_wgcf(){
   [[ -x "$WGCF_BIN" ]] && return 0
   local GOA url tmp
@@ -3007,15 +3069,20 @@ connection_settings_menu(){
     echo "  证书域名：$domain_text"
     echo "  Reality SNI：$REALITY_SERVER"
     echo "  导入安全：强制证书校验"
+    if managed_cert_sni_mismatch; then
+      echo -e "  ${C_YELLOW}托管证书仍是旧域名，与当前 SNI 不匹配${C_RESET}"
+    fi
     hr
     echo -e "  ${C_GREEN}1)${C_RESET} 设置 TLS 域名与证书"
     echo -e "  ${C_GREEN}2)${C_RESET} 修改 Reality SNI 域名"
+    echo -e "  ${C_GREEN}3)${C_RESET} 重新签发自签证书（匹配当前 SNI，会重启服务）"
     echo -e "  ${C_RED}0)${C_RESET} 返回主菜单"
     hr
     read -rp "选择: " op || return 0
     case "${op:-}" in
       1) edit_tls_certificate_settings || true; read -rp "回车继续..." _ || true ;;
       2) edit_reality_sni_setting || true; read -rp "回车继续..." _ || true ;;
+      3) reissue_managed_certificate || true; read -rp "回车继续..." _ || true ;;
       0|q|Q) return 0 ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
@@ -3748,6 +3815,8 @@ update_runtime_components(){
   else
     info "DNS 健康检查定时器原本未运行，已保持不运行（启用状态：${timer_was_enabled}）"
   fi
+  # 轻量更新不改配置也不重启服务，因此只提示，不自动重签
+  warn_if_cert_sni_mismatch
 }
 
 # 按内容而非 HTTP 状态码判定，避免把 404 页面或被劫持的响应当成脚本装上去
@@ -3833,6 +3902,8 @@ usage(){
                                  轻量更新管理脚本与 DNS 运行时组件
   sudo bash sbp.sh --update-script
                                  从 GitHub 拉取最新管理脚本并应用轻量更新
+  sudo bash sbp.sh --reissue-cert
+                                 重新签发自签证书使其匹配当前 Reality SNI（会重启 sing-box）
   sudo bash sbp.sh --uninstall   彻底卸载 Sing-Box-Plus
   bash sbp.sh --help             显示本帮助
 
@@ -3912,6 +3983,7 @@ main(){
     --update-geofiles) update_geofiles ;;
     --update-runtime) update_runtime_components ;;
     --update-script) update_script_from_remote ;;
+    --reissue-cert) reissue_managed_certificate ;;
     --uninstall) uninstall_all ;;
     -h|--help) usage ;;
     *)

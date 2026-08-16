@@ -29,6 +29,7 @@ export ROUTE_JSON="$test_root/state/routes.json"
 export SHARE_LINKS_FILE="$test_root/state/share-links.txt"
 export BIN_PATH="$test_root/bin/sing-box"
 export SYSTEMD_SERVICE="test-sing-box.service"
+export SBP_SKIP_ROOT=1
 
 # shellcheck source=../sing-box-plus.sh
 source "$main_script"
@@ -137,6 +138,34 @@ if [[ "$old_cert_hash" == "$new_cert_hash" ]]; then
 fi
 cert_matches_host "$TLS_CERT_PATH" edge.example.com \
   || { echo "FAIL: regenerated cert must match the updated SNI" >&2; exit 1; }
+
+# 自签证书落后于 SNI 时必须被检出，并可通过重签修复
+REALITY_SERVER=stale.example.com
+save_env
+if ! managed_cert_sni_mismatch; then
+  echo "FAIL: a managed cert left on the old SNI must be reported as mismatched" >&2
+  exit 1
+fi
+(reissue_managed_certificate) > "$test_root/reissue.log" 2>&1 \
+  || { echo "FAIL: reissue must succeed for a self-signed deployment" >&2; cat "$test_root/reissue.log" >&2; exit 1; }
+cert_matches_host "$TLS_CERT_PATH" stale.example.com \
+  || { echo "FAIL: reissued cert must match the current SNI" >&2; exit 1; }
+if managed_cert_sni_mismatch; then
+  echo "FAIL: mismatch must be cleared after reissuing" >&2
+  exit 1
+fi
+
+# 手动 / ACME 证书不由脚本签发，不应被报成不匹配
+TLS_CERT_MODE=manual
+if managed_cert_sni_mismatch; then
+  echo "FAIL: non self-signed modes must never be reported as SNI mismatched" >&2
+  exit 1
+fi
+TLS_CERT_MODE=self_signed
+
+REALITY_SERVER=edge.example.com
+save_env
+prepare_tls_certificate
 print_links_grouped > "$test_root/updated-sni-links.log"
 assert_equal 8 "$(grep -c 'insecure=1&sni=edge.example.com' "$SHARE_LINKS_FILE")" \
   "certificate-backed links must follow the updated self-signed SNI and allow insecure"
