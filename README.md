@@ -153,16 +153,19 @@ Reality SNI 可独立修改。脚本会同时更新服务端握手目标和 VLES
 - 解锁 Netflix、Disney+、ChatGPT 等受地域限制的服务
 - 规避服务器 IP 被目标网站封锁
 
-### 自定义路由
+### 自定义路由与默认出口
 
-菜单 `7) 自定义路由与分流规则` 可按目标网站指定出口：
+菜单 `7) 自定义路由与分流规则` 支持按目标网站指定出口分流，以及切换非 Warp 协议节点的默认出口 IP：
+
+- **非 Warp 节点默认出口**：支持将 10 个直连协议节点（VLESS-Reality、Hysteria2、TUIC 等）的默认出口 IP 切换为已导入的其他 VPS 节点、本机 IPv4、本机 IPv6 或 WARP。
+- **自定义分流规则**：支持为特定域名或 geosite 指定专属出口。
 
 | 出口类型 | 用途示例 |
 |----------|----------|
 | 本机 WARP | `geosite:netflix` 走 WARP 解锁流媒体 |
 | 本机 IPv4 | `suffix:openai.com` 固定走 IPv4 出口 |
 | 本机 IPv6 | 需要原生 IPv6 的场景 |
-| 远程 VPS 节点 | 粘贴分享链接（VLESS / Trojan / Hy2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）或 sing-box outbound JSON 导入 |
+| 远程 VPS 节点 | 粘贴分享链接（VLESS / Trojan / Hy2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）或 sing-box outbound JSON 导入，可作为分流出口或设为非 Warp 节点默认出口 |
 
 匹配项支持逗号或空格分隔，支持以下格式：
 

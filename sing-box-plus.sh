@@ -658,7 +658,7 @@ EOF
 load_warp(){ safe_source_env "$SB_DIR/warp.env" || return 1; }
 
 # ===== 自定义路由 =====
-empty_route_json(){ printf '%s\n' '{"rules":[],"rule_set":[],"outbounds":[]}'; }
+empty_route_json(){ printf '%s\n' '{"rules":[],"rule_set":[],"outbounds":[],"default_outbound":"direct"}'; }
 
 default_ipv4_address(){
   ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
@@ -688,7 +688,7 @@ ensure_route_file(){
 
 load_route_json(){
   if [[ -s "$ROUTE_JSON" ]] && jq -e 'type == "object"' "$ROUTE_JSON" >/dev/null 2>&1; then
-    jq -c '.rules = (.rules // []) | .rule_set = (.rule_set // []) | .outbounds = (.outbounds // [])' "$ROUTE_JSON"
+    jq -c '.rules = (.rules // []) | .rule_set = (.rule_set // []) | .outbounds = (.outbounds // []) | .default_outbound = (.default_outbound // "direct")' "$ROUTE_JSON"
   else
     empty_route_json
   fi
@@ -2168,7 +2168,8 @@ write_config(){
     (($CUSTOM_ROUTES.outbounds // []) | map(select((.tag // "") != "" and (.type // "") != "")));
 
   def custom_uses_outbound($tag):
-    ((($CUSTOM_ROUTES.rules // []) | map(select((.outbound // "") == $tag)) | length) > 0);
+    ((($CUSTOM_ROUTES.rules // []) | map(select((.outbound // "") == $tag)) | length) > 0)
+    or (($CUSTOM_ROUTES.default_outbound // "direct") == $tag);
 
   def custom_route_rule($rule):
     ({}
@@ -2204,8 +2205,15 @@ write_config(){
       domain_resolver:{server:"dns-doh-primary", strategy:"ipv6_only"}}
       + (if $BIND6 != "" then {inet6_bind_address:$BIND6, bind_address_no_port:true} else {} end));
 
+  def resolved_final_outbound:
+    ($CUSTOM_ROUTES.default_outbound // "direct") as $target
+    | if ($target == "direct" or $target == "direct-ipv4" or $target == "direct-ipv6" or ($target == "warp" and warp_ready) or ((custom_outbounds | map(.tag) | index($target)) != null))
+      then $target
+      else "direct"
+      end;
+
   def route_config:
-    ({default_domain_resolver:"dns-doh-primary", final:"direct"}
+    ({default_domain_resolver:"dns-doh-primary", final:resolved_final_outbound}
       + (if (route_rules | length) > 0 then {rules:route_rules} else {} end)
       + (if (custom_rule_sets | length) > 0 then {rule_set:custom_rule_sets} else {} end));
 
@@ -2409,12 +2417,14 @@ apply_custom_routing(){
 
 print_custom_routes(){
   ensure_route_file
-  local ip4 ip6
+  local ip4 ip6 def_outbound
   ip4="$(default_ipv4_address || true)"
   ip6="$(default_ipv6_address || true)"
+  def_outbound="$(jq -r '.default_outbound // "direct"' "$ROUTE_JSON" 2>/dev/null || echo "direct")"
   echo -e "${C_CYAN}当前本机出口:${C_RESET} IPv4=${ip4:-未检测到} IPv6=${ip6:-未检测到}"
+  echo -e "${C_CYAN}非 Warp 节点默认出口:${C_RESET} ${def_outbound}"
   echo
-  jq -r '
+  jq -r --arg def "$def_outbound" '
     def match_text:
       [(.domain // [] | map("domain:" + .))[],
        (.domain_suffix // [] | map("suffix:" + .))[],
@@ -2432,7 +2442,7 @@ print_custom_routes(){
     (if ((.outbounds // []) | length) == 0 then
       "  （无）"
     else
-      (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)]")
+      (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)]" + (if .value.tag == $def then " (当前默认出口)" else "" end))
     end)
   ' "$ROUTE_JSON"
 }
@@ -2587,6 +2597,86 @@ import_custom_route_outbound(){
   rm -f "$route_bak"
 }
 
+set_custom_default_outbound(){
+  ensure_route_file
+  local current_outbound choice target route_bak tmp ip4 ip6 idx tag
+  local -a imported
+  current_outbound="$(jq -r '.default_outbound // "direct"' "$ROUTE_JSON" 2>/dev/null || echo "direct")"
+  ip4="$(default_ipv4_address || true)"
+  ip6="$(default_ipv6_address || true)"
+  mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$ROUTE_JSON")
+
+  echo -e "当前非 Warp 节点出口: ${C_GREEN}${current_outbound}${C_RESET}"
+  echo "请选择要作为非 Warp 节点默认出口的目标："
+  echo "  1) 本机直连（direct，默认）"
+  echo "  2) 本机 IPv4（direct-ipv4，当前 ${ip4:-未检测到}）"
+  echo "  3) 本机 IPv6（direct-ipv6，当前 ${ip6:-未检测到}）"
+  echo "  4) 本机 WARP（warp）"
+  idx=5
+  for tag in "${imported[@]}"; do
+    if [[ "$tag" == "$current_outbound" ]]; then
+      echo "  ${idx}) 导入出口：${tag} (当前选中)"
+    else
+      echo "  ${idx}) 导入出口：${tag}"
+    fi
+    idx=$((idx+1))
+  done
+  read -rp "选择出口 [当前: ${current_outbound}]: " choice || return 1
+  choice="${choice:-}"
+  [[ -z "$choice" ]] && { info "未更改出口设置"; return 0; }
+
+  case "$choice" in
+    1) target="direct" ;;
+    2)
+      [[ -n "$ip4" ]] || warn "未检测到本机 IPv4，规则仍会使用 ipv4_only 解析策略。"
+      target="direct-ipv4"
+      ;;
+    3)
+      [[ -n "$ip6" ]] || warn "未检测到本机 IPv6，规则仍会使用 ipv6_only 解析策略。"
+      target="direct-ipv6"
+      ;;
+    4)
+      if ! load_warp >/dev/null 2>&1; then
+        warn "尚未检测到 WARP 配置；应用时会尝试生成，失败则无法生效。"
+      fi
+      target="warp"
+      ;;
+    *)
+      if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        idx=$((choice-5))
+        if (( idx >= 0 && idx < ${#imported[@]} )); then
+          target="${imported[$idx]}"
+        fi
+      fi
+      ;;
+  esac
+
+  if [[ -z "${target:-}" ]]; then
+    warn "无效出口选择"
+    return 1
+  fi
+
+  if [[ "$target" == "$current_outbound" ]]; then
+    info "出口未发生变化：${target}"
+    return 0
+  fi
+
+  route_bak="$(mktemp)"
+  cp "$ROUTE_JSON" "$route_bak"
+  tmp="$(mktemp)"
+  if jq -c --arg target "$target" '.default_outbound = $target' "$ROUTE_JSON" > "$tmp"; then
+    mv "$tmp" "$ROUTE_JSON"
+    if apply_custom_routing "$route_bak"; then
+      info "非 Warp 节点默认出口已成功切换为：${target}"
+    fi
+  else
+    rm -f "$tmp"
+    cp "$route_bak" "$ROUTE_JSON"
+    warn "保存出口配置失败。"
+  fi
+  rm -f "$route_bak"
+}
+
 remove_custom_route_rule(){
   ensure_route_file
   local idx route_bak tmp
@@ -2625,6 +2715,10 @@ remove_custom_route_outbound(){
     warn "该出口仍被路由规则使用，请先删除对应规则。"
     return 1
   fi
+  if jq -e --arg tag "$tag" '(.default_outbound // "direct") == $tag' "$ROUTE_JSON" >/dev/null; then
+    warn "该出口当前正作为非 Warp 节点的默认出口使用，请先将其切换为其他出口。"
+    return 1
+  fi
   if ! jq -e --arg tag "$tag" 'any(.outbounds[]?; .tag == $tag)' "$ROUTE_JSON" >/dev/null; then
     warn "远程出口不存在。"
     return 1
@@ -2646,12 +2740,12 @@ remove_custom_route_outbound(){
 clear_custom_route_rules(){
   ensure_route_file
   local route_bak tmp yn
-  read -rp "确认清空所有自定义路由规则？导入出口会保留。[y/N] " yn || return 1
+  read -rp "确认清空所有自定义路由规则？导入出口与默认出口设置会保留。[y/N] " yn || return 1
   [[ "$yn" =~ ^[Yy]$ ]] || return 1
   route_bak="$(mktemp)"
   cp "$ROUTE_JSON" "$route_bak"
   tmp="$(mktemp)"
-  if jq -c '.rules = [] | .rule_set = [] | .outbounds = (.outbounds // [])' "$ROUTE_JSON" > "$tmp"; then
+  if jq -c '.rules = [] | .rule_set = [] | .outbounds = (.outbounds // []) | .default_outbound = (.default_outbound // "direct")' "$ROUTE_JSON" > "$tmp"; then
     mv "$tmp" "$ROUTE_JSON"
     apply_custom_routing "$route_bak"
   else
@@ -2674,18 +2768,20 @@ custom_route_menu(){
     hr
     echo -e "  ${C_GREEN}1)${C_RESET} 添加网址 / geosite 路由规则"
     echo -e "  ${C_GREEN}2)${C_RESET} 导入其他 VPS 出口节点"
-    echo -e "  ${C_YELLOW}3)${C_RESET} 删除路由规则"
-    echo -e "  ${C_YELLOW}4)${C_RESET} 删除导入出口"
-    echo -e "  ${C_RED}5)${C_RESET} 清空自定义路由规则"
+    echo -e "  ${C_GREEN}3)${C_RESET} 设置非 Warp 节点默认出口 IP"
+    echo -e "  ${C_YELLOW}4)${C_RESET} 删除路由规则"
+    echo -e "  ${C_YELLOW}5)${C_RESET} 删除导入出口"
+    echo -e "  ${C_RED}6)${C_RESET} 清空自定义路由规则"
     echo -e "  ${C_RED}0)${C_RESET} 返回主菜单"
     hr
     read -rp "选择: " op || return 0
     case "${op:-}" in
       1) add_custom_route_rule; read -rp "回车继续..." _ || true ;;
       2) import_custom_route_outbound; read -rp "回车继续..." _ || true ;;
-      3) remove_custom_route_rule; read -rp "回车继续..." _ || true ;;
-      4) remove_custom_route_outbound; read -rp "回车继续..." _ || true ;;
-      5) clear_custom_route_rules; read -rp "回车继续..." _ || true ;;
+      3) set_custom_default_outbound; read -rp "回车继续..." _ || true ;;
+      4) remove_custom_route_rule; read -rp "回车继续..." _ || true ;;
+      5) remove_custom_route_outbound; read -rp "回车继续..." _ || true ;;
+      6) clear_custom_route_rules; read -rp "回车继续..." _ || true ;;
       0|q|Q) return 0 ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
@@ -2997,7 +3093,15 @@ show_service_status(){
     fi
   }
 
-  echo -e "  ${C_CYAN}[直连 10 节点]${C_RESET}"
+  local cur_def_outbound="direct"
+  if [[ -s "$ROUTE_JSON" ]] && command -v jq >/dev/null 2>&1; then
+    cur_def_outbound="$(jq -r '.default_outbound // "direct"' "$ROUTE_JSON" 2>/dev/null || echo "direct")"
+  fi
+  local def_label="直连 10 节点"
+  if [[ "$cur_def_outbound" != "direct" ]]; then
+    def_label="默认出口 10 节点 (当前出口: ${cur_def_outbound})"
+  fi
+  echo -e "  ${C_CYAN}[${def_label}]${C_RESET}"
   printf "    %-18s : %b\n" "1. VLESS-Reality" "$(check_port_status "${PORT_VLESSR:-}" "tcp")"
   printf "    %-18s : %b\n" "2. VLESS-gRPC-Real" "$(check_port_status "${PORT_VLESS_GRPCR:-}" "tcp")"
   printf "    %-18s : %b\n" "3. Trojan-Reality" "$(check_port_status "${PORT_TROJANR:-}" "tcp")"
@@ -3174,6 +3278,7 @@ run_diagnostics(){
     echo "== 自定义路由 =="
     if [[ -s "$ROUTE_JSON" ]]; then
       jq -r '
+        "default_outbound=" + (.default_outbound // "direct"),
         "rules=" + (((.rules // []) | length) | tostring),
         "rule_set=" + (((.rule_set // []) | length) | tostring),
         "imported_outbounds=" + (((.outbounds // []) | length) | tostring)

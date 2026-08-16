@@ -11,6 +11,10 @@ command -v jq >/dev/null 2>&1 || {
   exit 1
 }
 
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) export MSYS2_ARG_CONV_EXCL='/CN=' ;;
+esac
+
 export SBP_SKIP_DEPS=1
 export SBP_SKIP_ROOT=1
 export SBP_ROOT="$test_root/sbp-root"
@@ -60,7 +64,17 @@ fi
 # 2. 测试 get_singbox_local_version
 cat > "$BIN_PATH" <<'EOF'
 #!/usr/bin/env bash
-echo "sing-box version 1.11.5"
+case "${1:-}" in
+  version) echo "sing-box version 1.11.5" ;;
+  check) exit 0 ;;
+  generate)
+    if [[ "${2:-}" == "reality-keypair" ]]; then
+      echo "PrivateKey: mock-priv-key"
+      echo "PublicKey: mock-pub-key"
+    fi
+    ;;
+  *) echo "sing-box version 1.11.5" ;;
+esac
 EOF
 chmod 0755 "$BIN_PATH"
 local_v=$(get_singbox_local_version "$BIN_PATH")
@@ -162,7 +176,47 @@ out_tg_http=$(share_link_to_outbound "tg://http-proxy?server=198.51.100.3&port=8
 assert_equal "http" "$(printf '%s' "$out_tg_http" | jq -r '.type')" "tg http type"
 assert_equal "tghttp" "$(printf '%s' "$out_tg_http" | jq -r '.username')" "tg http username"
 
-# 6. 测试 uninstall_all 交互取消与确认
+# 6. 测试非 Warp 节点默认出口设置、配置生成与删除防护
+ensure_route_file
+assert_equal "direct" "$(load_route_json | jq -r '.default_outbound')" "default outbound must default to direct"
+
+# 导入节点并设为 default_outbound
+jq --argjson ob "$out_socks5" '.outbounds += [$ob] | .default_outbound = "ext-socks"' "$ROUTE_JSON" > "$ROUTE_JSON.tmp" && mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
+write_config
+assert_equal "ext-socks" "$(jq -r '.route.final' "$CONF_JSON")" "route.final must use configured default_outbound"
+assert_equal "socks" "$(jq -r '.outbounds[] | select(.tag == "ext-socks") | .type' "$CONF_JSON")" "outbounds must contain imported default exit"
+
+# 当节点被设为默认出口时，禁止直接删除
+remove_log="$test_root/remove_blocked.log"
+(echo "ext-socks" | remove_custom_route_outbound) > "$remove_log" 2>&1 || true
+if ! grep -q "该出口当前正作为非 Warp 节点的默认出口使用" "$remove_log"; then
+  echo "FAIL: remove_custom_route_outbound must block deleting active default outbound" >&2
+  exit 1
+fi
+assert_equal "ext-socks" "$(jq -r '.outbounds[] | select(.tag == "ext-socks") | .tag' "$ROUTE_JSON")" "blocked outbound must remain in routes.json"
+
+# 切换为 direct-ipv4
+jq '.default_outbound = "direct-ipv4"' "$ROUTE_JSON" > "$ROUTE_JSON.tmp" && mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
+write_config
+assert_equal "direct-ipv4" "$(jq -r '.route.final' "$CONF_JSON")" "route.final must be direct-ipv4"
+assert_equal "direct" "$(jq -r '.outbounds[] | select(.tag == "direct-ipv4") | .type' "$CONF_JSON")" "outbounds must include direct-ipv4 outbound"
+
+# 切换后允许删除该导入节点
+(echo "ext-socks" | remove_custom_route_outbound) > "$test_root/remove_ok.log" 2>&1 || true
+assert_equal "0" "$(jq '[.outbounds[] | select(.tag == "ext-socks")] | length' "$ROUTE_JSON")" "unlinked outbound must be successfully removed"
+
+# 测试非法/未知 default_outbound 安全回退为 direct
+jq '.default_outbound = "invalid-ghost-outbound"' "$ROUTE_JSON" > "$ROUTE_JSON.tmp" && mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
+write_config
+assert_equal "direct" "$(jq -r '.route.final' "$CONF_JSON")" "invalid default_outbound must safely fallback to direct"
+
+# 测试 clear_custom_route_rules 保留 default_outbound
+jq '.default_outbound = "direct-ipv6" | .rules = [{outbound:"direct-ipv6",domain:["test.com"]}]' "$ROUTE_JSON" > "$ROUTE_JSON.tmp" && mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
+(echo "y" | clear_custom_route_rules) > "$test_root/clear_rules.log" 2>&1 || true
+assert_equal "0" "$(jq '(.rules // []) | length' "$ROUTE_JSON")" "rules must be cleared"
+assert_equal "direct-ipv6" "$(jq -r '.default_outbound' "$ROUTE_JSON")" "clear_custom_route_rules must preserve default_outbound"
+
+# 7. 测试 uninstall_all 交互取消与确认
 (echo "n" | uninstall_all) > "$test_root/uninstall_cancel.log" 2>&1 || true
 if [[ ! -d "$SB_DIR" ]]; then
   echo "FAIL: canceling uninstall must keep $SB_DIR intact" >&2
@@ -179,4 +233,4 @@ if [[ -f "$BIN_PATH" ]]; then
   exit 1
 fi
 
-printf '%s\n' "PASS: enhanced features (version compare, geofiles update, status viewer, socks/http import, uninstall) work correctly"
+printf '%s\n' "PASS: enhanced features (version compare, geofiles update, status viewer, socks/http import, default outbound, uninstall) work correctly"
